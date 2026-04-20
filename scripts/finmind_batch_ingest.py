@@ -396,6 +396,112 @@ def ingest_per_pbr_data(stock_ids: list[str], since: str | None,
     return total_wrote, errors
 
 
+# ── Margin (融資融券) ────────────────────────────────────────────────────────
+
+def write_margin(conn: sqlite3.Connection, records: list[dict]) -> int:
+    n = 0
+    for r in records:
+        try:
+            conn.execute("""
+                INSERT OR REPLACE INTO margin_short
+                    (stock_id, date, margin_balance, short_balance,
+                     margin_buy, margin_sell, short_buy, short_sell)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                r.get("stock_id", ""),
+                r.get("date", ""),
+                r.get("MarginPurchaseTodayBalance", 0),
+                r.get("ShortSaleTodayBalance", 0),
+                r.get("MarginPurchaseBuy", 0),
+                r.get("MarginPurchaseSell", 0),
+                r.get("ShortSaleBuy", 0),
+                r.get("ShortSaleSell", 0),
+            ))
+            n += 1
+        except Exception:
+            pass
+    return n
+
+
+def ingest_margin_data(stock_ids: list[str], since: str | None,
+                        token: str, batch_size: int = BATCH_SIZE,
+                        delay: float = BATCH_DELAY) -> tuple[int, list[str]]:
+    conn = sqlite3.connect(DB_PATH)
+    total_wrote = 0
+    errors: list[str] = []
+    end = date.today().isoformat()
+    start = since or "2020-01-01"
+    print(f"[margin] start={start}  end={end}  stocks={len(stock_ids)}")
+    n = len(stock_ids)
+    for i in tqdm(range(0, n, batch_size), desc="[margin]", unit="batch"):
+        batch = stock_ids[i:i + batch_size]
+        try:
+            df = dl.taiwan_stock_margin_purchase_short_sale(
+                stock_id=batch, start_date=start, end_date=end,
+            )
+            records = df.to_dict(orient="records") if not df.empty else []
+            if records:
+                n_written = write_margin(conn, records)
+                total_wrote += n_written
+        except Exception as e:
+            errors.append(f"batch[{i}]: {e}")
+        conn.commit()
+        if i + batch_size < n:
+            time.sleep(delay)
+    conn.close()
+    return total_wrote, errors
+
+
+# ── Stock Info (基本資料) ────────────────────────────────────────────────────
+
+def write_stock_info(conn: sqlite3.Connection, records: list[dict]) -> int:
+    n = 0
+    for r in records:
+        try:
+            conn.execute("""
+                INSERT OR REPLACE INTO stock_info
+                    (stock_id, name, industry, listed_date, capital,
+                     shares, par_value, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                r.get("stock_id", ""),
+                r.get("stock_name", r.get("name", "")),
+                r.get("industry", ""),
+                r.get("date", ""),
+                r.get("capital", 0),
+                r.get("shares", 0),
+                r.get("par_value", 0),
+                date.today().isoformat(),
+            ))
+            n += 1
+        except Exception:
+            pass
+    return n
+
+
+def ingest_stock_info(_stock_ids: list[str], _since: str | None,
+                       _token: str, batch_size: int = BATCH_SIZE,
+                       delay: float = BATCH_DELAY) -> tuple[int, list[str]]:
+    conn = sqlite3.connect(DB_PATH)
+    total_wrote = 0
+    errors: list[str] = []
+    try:
+        print(f"[stock_info] fetching all stocks …")
+        df = dl.taiwan_stock_info()
+        records = df.to_dict(orient="records") if not df.empty else []
+        for i in tqdm(range(0, len(records), batch_size), desc="[stock_info]", unit="batch"):
+            chunk = records[i:i + batch_size]
+            n_written = write_stock_info(conn, chunk)
+            total_wrote += n_written
+            conn.commit()
+            time.sleep(delay)
+    except Exception as e:
+        errors.append(str(e))
+        print(f"ERROR: {e}")
+    conn.close()
+    return total_wrote, errors
+
+
 # ── Stock list resolution ────────────────────────────────────────────────────
 
 def resolve_stock_ids(limit: int | None, token: str) -> list[str]:
@@ -436,6 +542,8 @@ DATASETS = {
     "institutional":  ingest_institutional_data,
     "monthly_revenue": ingest_monthly_revenue_data,
     "per_pbr":         ingest_per_pbr_data,
+    "margin":          ingest_margin_data,
+    "stock_info":      ingest_stock_info,
 }
 
 
