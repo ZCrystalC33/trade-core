@@ -159,6 +159,28 @@ def init_database():
     """)
 
     # ──────────────────────────────────────────────
+    # TABLE 9: 融資融券（信用交易）
+    # ──────────────────────────────────────────────
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS margin_short (
+        stock_id          TEXT    NOT NULL,  -- 股票代碼
+        date              TEXT    NOT NULL,  -- 日期（YYYY-MM-DD）
+        margin_buy        INTEGER DEFAULT 0,  -- 融資買進（張）
+        margin_buy_amount REAL    DEFAULT 0,  -- 融資買進金額（元）
+        margin_sell       INTEGER DEFAULT 0,  -- 融資賣出（張）
+        margin_balance    INTEGER DEFAULT 0,  -- 融资余额（張）
+        short_sell        INTEGER DEFAULT 0,  -- 融券賣出（張）
+        short_cover       INTEGER DEFAULT 0,  -- 融券買進（張）
+        short_balance     INTEGER DEFAULT 0,  -- 融券餘額（張）
+        margin_call       REAL    DEFAULT 0,  -- 融資維持率（%）
+        short_call        REAL    DEFAULT 0,  -- 融券維持率（%）
+        lend_balance      INTEGER DEFAULT 0,  -- 借券餘額（張）
+        updated_at        TEXT    NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (stock_id, date)
+    )
+    """)
+
+    # ──────────────────────────────────────────────
     # TABLE 9: 宏觀經濟數據
     # ──────────────────────────────────────────────
     cursor.execute("""
@@ -210,6 +232,7 @@ def init_database():
         "trade_signals      — 交易訊號記錄",
         "trades             — 實際交易紀錄",
         "alerts             — 警示日誌",
+        "margin_short       — 融資融券（信用交易）",
         "macro_data         — 宏觀經濟數據",
         "system_log         — 系統日誌",
     ]
