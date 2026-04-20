@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
  資料攝取模組 ②：三大法人買賣（FinMind API）
- 用法：python3 ingest_institutional.py --stock 4967 --start 2025-01-01 --end 2026-04-20
+ 用法：
+   單支股票：python3 ingest_institutional.py --stock 4967 --start 2025-01-01 --end 2026-04-20
+   全部股票：python3 ingest_institutional.py --start 2025-01-01 --end 2026-04-20
 """
 
 import os
@@ -34,6 +36,18 @@ def get_token() -> str:
     return ""
 
 
+def get_all_stock_ids() -> list:
+    """從資料庫取得所有有日K資料的股票代號"""
+    if not DB_PATH.exists():
+        raise FileNotFoundError(f"資料庫不存在：{DB_PATH}")
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT DISTINCT stock_id FROM daily_price ORDER BY stock_id")
+    rows = cursor.fetchall()
+    conn.close()
+    return [row[0] for row in rows]
+
+
 def fetch_institutional(stock_id: str, start_date: str, end_date: str, token: str) -> list:
     """從 FinMind 抓三大法人買賣資料"""
     url = f"{FINMIND_API}/data"
@@ -56,7 +70,7 @@ def fetch_institutional(stock_id: str, start_date: str, end_date: str, token: st
     return data.get("data", [])
 
 
-def save_institutional(records: list):
+def save_institutional(stock_id: str, records: list):
     """寫入 institutional 資料表"""
     if not records:
         print("⚠️  無法人資料可寫入")
@@ -98,8 +112,8 @@ def save_institutional(records: list):
                 INSERT OR REPLACE INTO institutional
                 (stock_id, date, foreign_buy, foreign_sell, prop_buy, prop_sell,
                  dealer_buy, dealer_sell, net_buy)
-                VALUES ('4967', ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (date,
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (stock_id, date,
                   vals["foreign_buy"], vals["foreign_sell"],
                   vals["prop_buy"], vals["prop_sell"],
                   vals["dealer_buy"], vals["dealer_sell"],
@@ -110,7 +124,7 @@ def save_institutional(records: list):
 
     conn.commit()
     conn.close()
-    print(f"✅ 寫入 {inserted} 筆到 institutional")
+    print(f"✅ 寫入 {inserted} 筆到 institutional（{stock_id}）")
     return inserted
 
 
@@ -125,7 +139,8 @@ def log(msg: str, level: str = "INFO"):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="三大法人資料攝取")
-    parser.add_argument("--stock", type=str, default="4967")
+    parser.add_argument("--stock", type=str, default=None,
+                        help="股票代號（不指定則處理資料庫中所有有日K的股票）")
     parser.add_argument("--start", type=str, default="2025-01-01")
     parser.add_argument("--end", type=str, default="2026-04-20")
     args = parser.parse_args()
@@ -135,10 +150,31 @@ if __name__ == "__main__":
         print("⚠️  無 FinMind Token，使用 --demo 模式需要環境變數或 ~/.trade_core.env")
         sys.exit(1)
 
-    try:
-        records = fetch_institutional(args.stock, args.start, args.end, token)
-        save_institutional(records)
-        log(f"institutional 完成：{args.stock}，共 {len(records)} 筆")
-    except Exception as e:
-        log(f"錯誤：{e}", "ERROR")
+    # 決定要處理的股票清單
+    if args.stock:
+        stock_list = [args.stock]
+    else:
+        try:
+            stock_list = get_all_stock_ids()
+            print(f"📋 資料庫共有 {len(stock_list)} 支股票需處理")
+        except Exception as e:
+            log(f"無法取得股票清單：{e}", "ERROR")
+            sys.exit(1)
+
+    total_records = 0
+    errors = []
+    for stock_id in stock_list:
+        try:
+            records = fetch_institutional(stock_id, args.start, args.end, token)
+            save_institutional(stock_id, records)
+            log(f"institutional 完成：{stock_id}，共 {len(records)} 筆")
+            total_records += len(records)
+        except Exception as e:
+            log(f"錯誤（{stock_id}）：{e}", "ERROR")
+            errors.append(stock_id)
+
+    if errors:
+        log(f"以下股票處理失敗：{errors}", "ERROR")
         sys.exit(1)
+
+    log(f"全部完成，共處理 {len(stock_list)} 支股票，總計 {total_records} 筆原始記錄")
