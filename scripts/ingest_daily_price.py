@@ -8,6 +8,7 @@
    python3 ingest_daily_price.py --stock 4967 --demo   # 使用模擬資料示範
 """
 
+import os
 import sys
 import json
 import sqlite3
@@ -21,8 +22,18 @@ LOG_FILE = Path(__file__).parent.parent / "logs" / "data_ingest.log"
 
 # FinMind API 設定
 FINMIND_BASE = "https://api.finmindtrade.com/api/v4"
-# 公開 demo token（僅供測試，正式環境請用自己的帳號）
-DEMO_TOKEN = "demo"
+
+
+def get_token() -> str:
+    token = os.environ.get("FINMIND_TOKEN", "")
+    if token:
+        return token
+    tf = Path.home() / ".trade_core.env"
+    if tf.exists():
+        for line in tf.read_text().splitlines():
+            if line.startswith("FINMIND_TOKEN="):
+                return line.split("=", 1)[1].strip()
+    return ""
 
 
 def log(msg: str, level: str = "INFO"):
@@ -34,7 +45,7 @@ def log(msg: str, level: str = "INFO"):
         f.write(line + "\n")
 
 
-def fetch_daily_price_api(stock_id: str, start_date: str, end_date: str, token: str = "") -> list:
+def fetch_daily_price_api(stock_id: str, start_date: str, end_date: str, token: str) -> list:
     """從 FinMind API 抓取日K（GET 方式）"""
     url = f"{FINMIND_BASE}/data"
     params = {

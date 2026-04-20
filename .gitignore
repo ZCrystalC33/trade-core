@@ -26,3 +26,4 @@ logs/*.log
 # OS
 .DS_Store
 Thumbs.db
+.trade_core.env
