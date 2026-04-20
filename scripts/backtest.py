@@ -13,6 +13,12 @@
    python3 backtest.py --stock 4967 --strategy kd_cross --start 2025-01-01
    python3 backtest.py --stock 2330 --strategy macd_bull --start 2025-01-01
    python3 backtest.py --stock all --strategy all
+
+ 交易成本說明（台股預設）：
+   - 單邊手續費  0.5%，來回 1.0%
+   - 進場價 × 1.005 = 真實成本價（跌破此值即虧損）
+   - 停利 15%（毛利）= 淨利約 14%（扣除來回 1%）
+   - 停損門檻以進場價為基準，但實際虧損已內含進場手續費
 """
 
 import os
@@ -25,6 +31,7 @@ from collections import defaultdict
 
 import pandas as pd
 import indicators_lib as il
+import cost_model as cm
 
 DB_PATH = Path(__file__).parent.parent / "data" / "stock_quant.db"
 
@@ -139,20 +146,36 @@ def backtest(strategy_name: str, stock_id: str, start_date: str,
              stop_loss_pct: float = 0.07,
              take_profit_pct: float = 0.15,
              max_hold_days: int = 20,
-             slippage_pct: float = 0.002) -> dict:
+             slippage_pct: float = 0.002,
+             market: str = "TW") -> dict:
     """
     單一策略回測
 
     參數：
-      stop_loss_pct      停損%（預設7%）
-      take_profit_pct    停利%（預設15%）
+      stop_loss_pct      停損%（預設7%）— 以進場價為基準的毛跌幅門檻
+      take_profit_pct    停利%（預設15%）— 以進場價為基準的目標毛利率
       max_hold_days      最長持有天數
       slippage_pct       滑價%（預設0.2%）
+      market             市場別（"TW"台股/"US"美股/"CRYPTO"加密幣，預設TW）
+
+    成本模型（台股預設）：
+      - 進場真實成本價 = 進場價 × 1.005
+        → 跌破此價即已虧損（含進場手續費）
+      - 停損觸發門檻 = 進場價下跌 stop_loss_pct
+        → 到出場時再扣出場手續費，實際虧損 = 毛損 + 0.5%
+      - 停利觸發門檻 = 進場價上漲 (take_profit_pct + 來回費率)
+        → 毛利需先覆蓋來回 1% 成本，才能拿到目標淨利
+      - 最終 pnl_pct 以 net_pnl_pct() 回報，已扣除來回手續費
     """
 
     df = get_adjusted_prices(stock_id, start_date)
     if len(df) < 60:
         return {"error": f"資料不足（{len(df)}筆），需要至少60筆"}
+
+    # 建立成本模型（依市場別）
+    cost = cm.CostModel(market)
+    # 停利觸發門檻調整：毛利需先覆蓋來回成本，才能實現目標淨利
+    gross_take_profit_pct = cost.adjusted_take_profit_pct(take_profit_pct)
 
     strategy_fn = {
         "kd_cross":     Strategies.kd_low_gold,
@@ -165,7 +188,7 @@ def backtest(strategy_name: str, stock_id: str, start_date: str,
         return {"error": f"未知策略：{strategy_name}"}
 
     trades = []
-    position = None  # {'entry_date','entry_idx','entry_price','shares'}
+    position = None  # {'entry_date','entry_idx','entry_price','cost_basis','shares'}
 
     i = 1  # 從第2根開始（有前一筆可以比較交叉）
     while i < len(df):
@@ -197,11 +220,16 @@ def backtest(strategy_name: str, stock_id: str, start_date: str,
                     triggered = strategy_fn(ind)
 
             if triggered:
-                entry_price = ind["close"] * (1 + slippage_pct)  # 假設滑價
+                # 進場價：信號收盤價 + 滑價（下一根開盤的近似估計）
+                entry_price = ind["close"] * (1 + slippage_pct)
+                # 真實成本價：進場價 + 單邊進場手續費
+                # 跌破此價即表示已開始虧損（含進場費用）
+                cost_basis = cost.cost_basis(entry_price)
                 position = {
                     "entry_date":  ind["date"],
                     "entry_idx":   i,
                     "entry_price": entry_price,
+                    "cost_basis":  cost_basis,  # 進場價 × (1 + one_way_rate)
                     "signal":      strategy_name,
                     "reason":      f"{ind['date']} {stock_id} 進場",
                 }
@@ -212,27 +240,37 @@ def backtest(strategy_name: str, stock_id: str, start_date: str,
             hold_days = i - position["entry_idx"]
             current_price = df.iloc[i]["close"]
 
-            pnl_pct = (current_price - position["entry_price"]) / position["entry_price"]
+            # 以進場價計算毛損益率（未含手續費）
+            gross_pnl_pct = (current_price - position["entry_price"]) / position["entry_price"]
 
-            # 停損
-            if pnl_pct <= -stop_loss_pct:
+            # 停損判斷：
+            #   以進場價為基準的毛跌幅 >= stop_loss_pct 時出場。
+            #   注意：由於進場時已付 one_way_rate，加上出場的 one_way_rate，
+            #   實際淨虧損 = 毛損 + 來回費率（比帳面更大）。
+            if gross_pnl_pct <= -stop_loss_pct:
                 exit_reason = "STOP_LOSS"
-            # 停利
-            elif pnl_pct >= take_profit_pct:
+            # 停利判斷：
+            #   毛利需達到 gross_take_profit_pct（= 目標淨利 + 來回費率）才出場，
+            #   確保出場後扣除來回手續費仍能拿到目標淨利。
+            elif gross_pnl_pct >= gross_take_profit_pct:
                 exit_reason = "TAKE_PROFIT"
             # 持有期滿
             elif hold_days >= max_hold_days:
                 exit_reason = "TIME_UP"
 
             if exit_reason:
+                # 出場價：含滑價
                 exit_price = current_price * (1 - slippage_pct)
+                # 淨損益率：已扣除來回手續費
+                net_pnl = cost.net_pnl_pct(position["entry_price"], exit_price)
                 trades.append({
                     "stock_id":    stock_id,
                     "entry_date":  position["entry_date"],
                     "entry_price": position["entry_price"],
+                    "cost_basis":  position["cost_basis"],
                     "exit_date":   df.iloc[i]["date"],
                     "exit_price":  exit_price,
-                    "pnl_pct":     round((exit_price - position["entry_price"]) / position["entry_price"] * 100, 2),
+                    "pnl_pct":     round(net_pnl, 2),   # 淨損益率（已扣來回費）
                     "hold_days":   hold_days,
                     "exit_reason": exit_reason,
                     "signal":      position["signal"],
@@ -241,17 +279,18 @@ def backtest(strategy_name: str, stock_id: str, start_date: str,
 
         i += 1
 
-    # 若持有到最後一天仍未出廠，記為未實現
+    # 若持有到最後一天仍未出廠，記為未實現（以收盤價估算淨損益）
     if position is not None:
         last_close = df.iloc[-1]["close"]
-        pnl_pct = (last_close - position["entry_price"]) / position["entry_price"] * 100
+        net_pnl = cost.net_pnl_pct(position["entry_price"], last_close)
         trades.append({
             "stock_id":    stock_id,
             "entry_date":  position["entry_date"],
             "entry_price": position["entry_price"],
+            "cost_basis":  position["cost_basis"],
             "exit_date":   df.iloc[-1]["date"],
             "exit_price":  last_close,
-            "pnl_pct":     round(pnl_pct, 2),
+            "pnl_pct":     round(net_pnl, 2),
             "hold_days":   len(df) - 1 - position["entry_idx"],
             "exit_reason": "STILL_HOLDING",
             "signal":      position["signal"],
@@ -323,25 +362,26 @@ def print_backtest_report(result: dict):
     s = result["stats"]
     trades = result["trades"]
 
-    print(f"\n{'='*55}")
+    print(f"\n{'='*60}")
     print(f"【Stephanie 回測報告】{result['stock_id']} × {result['strategy']}")
-    print(f"{'='*55}")
+    print(f"{'='*60}")
     print(f"  總交易次數  ：{s['total_trades']} 筆")
     print(f"  勝率        ：{s['win_rate']}%")
-    print(f"  平均報酬    ：{s['avg_pnl']}%")
+    print(f"  平均報酬    ：{s['avg_pnl']}%（已扣手續費）")
     print(f"  平均獲利    ：{s['avg_win']}%")
     print(f"  平均虧損    ：{s['avg_loss']}%")
     print(f"  最大區間虧損：{s['max_drawdown']}%")
     print(f"  總報酬率    ：{s['total_return']}%")
     print(f"  平均持有天數：{s['avg_hold_days']} 天")
-    print(f"{'='*55}")
+    print(f"{'='*60}")
 
     if trades:
-        print("\n近10筆交易：")
-        print(f"  {'進場日':<12} {'進場價':>8} {'出場日':<12} {'出場價':>8} {'報酬%':>7} {'持有天':>6} {'原因'}")
-        print("  " + "-" * 65)
+        print("\n近10筆交易（pnl_pct 已扣來回手續費）：")
+        print(f"  {'進場日':<12} {'進場價':>8} {'成本價':>8} {'出場日':<12} {'出場價':>8} {'淨利%':>7} {'持有天':>6} {'原因'}")
+        print("  " + "-" * 75)
         for t in trades[-10:]:
-            print(f"  {t['entry_date']:<12} {t['entry_price']:>8.2f} {t['exit_date']:<12} "
+            cb = t.get("cost_basis", t["entry_price"])
+            print(f"  {t['entry_date']:<12} {t['entry_price']:>8.2f} {cb:>8.2f} {t['exit_date']:<12} "
                   f"{t['exit_price']:>8.2f} {t['pnl_pct']:>+7.2f}% {t['hold_days']:>6} {t['exit_reason']}")
 
 
@@ -357,6 +397,9 @@ if __name__ == "__main__":
     parser.add_argument("--stop-loss", type=float, default=0.07)
     parser.add_argument("--take-profit", type=float, default=0.15)
     parser.add_argument("--max-hold", type=int, default=20)
+    parser.add_argument("--market", type=str, default="TW",
+                        choices=["TW", "US", "CRYPTO"],
+                        help="市場別（TW台股/US美股/CRYPTO加密幣，預設TW）")
     args = parser.parse_args()
     stocks = args.stock.split()
     for sid in stocks:
@@ -367,5 +410,6 @@ if __name__ == "__main__":
             stop_loss_pct=args.stop_loss,
             take_profit_pct=args.take_profit,
             max_hold_days=args.max_hold,
+            market=args.market,
         )
         print_backtest_report(result)
