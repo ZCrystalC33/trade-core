@@ -190,11 +190,8 @@ def fetch_daily_price_batch(token: str, stock_ids: list[str],
 def fetch_institutional_batch(token: str, stock_ids: list[str],
                                start: str, end: str) -> list[dict]:
     """Fetch institutional data for a list of stock_ids."""
-    df = dl.taiwan_stock_institutional(
-        
-        stock_id=stock_ids,
-        start_date=start,
-        end_date=end,
+    df = dl.taiwan_stock_institutional_investors(
+        stock_id=stock_ids, start_date=start, end_date=end,
     )
     return df.to_dict(orient="records")
 
@@ -269,11 +266,8 @@ def ingest_institutional_data(stock_ids: list[str], since: str | None,
         batch = stock_ids[i:i + batch_size]
 
         try:
-            df = dl.taiwan_stock_institutional(
-                
-                stock_id=batch,
-                start_date=start,
-                end_date=end,
+            df = dl.taiwan_stock_institutional_investors(
+                stock_id=batch, start_date=start, end_date=end,
             )
             records = df.to_dict(orient="records")
             if records:
@@ -287,6 +281,117 @@ def ingest_institutional_data(stock_ids: list[str], since: str | None,
         if i + batch_size < n:
             time.sleep(delay)
 
+    conn.close()
+    return total_wrote, errors
+
+
+# ── Monthly Revenue ──────────────────────────────────────────────────────────
+
+def write_monthly_revenue(conn: sqlite3.Connection, records: list[dict]) -> int:
+    """寫入 monthly_revenue 表。欄位：stock_id, revenue_month, revenue, yoy_change, mom_change"""
+    n = 0
+    for r in records:
+        try:
+            conn.execute("""
+                INSERT OR REPLACE INTO monthly_revenue
+                    (stock_id, revenue_month, revenue, yoy_change, mom_change)
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                r.get("stock_id", ""),
+                r.get("date", ""),       # revenue_month = date
+                r.get("revenue", 0),
+                r.get("yoy_change", 0),
+                r.get("mom_change", 0),
+            ))
+            n += 1
+        except Exception:
+            pass
+    return n
+
+
+def ingest_monthly_revenue_data(stock_ids: list[str], since: str | None,
+                                  token: str, batch_size: int = BATCH_SIZE,
+                                  delay: float = BATCH_DELAY) -> tuple[int, list[str]]:
+    """月營收資料增量攝取。"""
+    conn = sqlite3.connect(DB_PATH)
+    total_wrote = 0
+    errors: list[str] = []
+    end = date.today().isoformat()
+    start = since or "2010-01-01"
+    print(f"[monthly_revenue] start={start}  end={end}  stocks={len(stock_ids)}")
+    n = len(stock_ids)
+    for i in tqdm(range(0, n, batch_size), desc="[monthly_revenue]", unit="batch"):
+        batch = stock_ids[i:i + batch_size]
+        try:
+            df = dl.taiwan_stock_month_revenue(
+                stock_id=batch, start_date=start, end_date=end,
+            )
+            records = df.to_dict(orient="records") if not df.empty else []
+            if records:
+                n_written = write_monthly_revenue(conn, records)
+                total_wrote += n_written
+        except Exception as e:
+            errors.append(f"batch[{i}]: {e}")
+        conn.commit()
+        if i + batch_size < n:
+            time.sleep(delay)
+    conn.close()
+    return total_wrote, errors
+
+
+# ── PER / PBR ────────────────────────────────────────────────────────────────
+
+def write_per_pbr(conn: sqlite3.Connection, records: list[dict]) -> int:
+    """寫入 stock_info 表（更新 per/pbr/dividend_yield）。"""
+    n = 0
+    for r in records:
+        try:
+            conn.execute("""
+                UPDATE stock_info SET
+                    per = ?,
+                    pbr = ?,
+                    dividend_yield = ?,
+                    updated_at = ?
+                WHERE stock_id = ?
+            """, (
+                r.get("PER", None),
+                r.get("PBR", None),
+                r.get("dividend_yield", None),
+                date.today().isoformat(),
+                r.get("stock_id", ""),
+            ))
+            n += 1
+        except Exception:
+            pass
+    return n
+
+
+def ingest_per_pbr_data(stock_ids: list[str], since: str | None,
+                          token: str, batch_size: int = BATCH_SIZE,
+                          delay: float = BATCH_DELAY) -> tuple[int, list[str]]:
+    """PER/PBR 資料增量攝取。"""
+    conn = sqlite3.connect(DB_PATH)
+    total_wrote = 0
+    errors: list[str] = []
+    end = date.today().isoformat()
+    start = since or "2020-01-01"
+    print(f"[per_pbr] start={start}  end={end}  stocks={len(stock_ids)}")
+    n = len(stock_ids)
+    for i in tqdm(range(0, n, batch_size), desc="[per_pbr]", unit="batch"):
+        batch = stock_ids[i:i + batch_size]
+        try:
+            df = dl.taiwan_stock_per_pbr(
+                stock_id=batch, start_date=start, end_date=end,
+            )
+            records = df.to_dict(orient="records") if not df.empty else []
+            if records:
+                n_written = write_per_pbr(conn, records)
+                total_wrote += n_written
+        except Exception as e:
+            errors.append(f"batch[{i}]: {e}")
+        conn.commit()
+        if i + batch_size < n:
+            time.sleep(delay)
     conn.close()
     return total_wrote, errors
 
@@ -327,8 +432,10 @@ def resolve_stock_ids(limit: int | None, token: str) -> list[str]:
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 DATASETS = {
-    "daily_price":    ingest_daily_price,
+    "daily_price":     ingest_daily_price,
     "institutional":  ingest_institutional_data,
+    "monthly_revenue": ingest_monthly_revenue_data,
+    "per_pbr":         ingest_per_pbr_data,
 }
 
 
