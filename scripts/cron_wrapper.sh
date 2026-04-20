@@ -9,8 +9,12 @@ set -euo pipefail
 export TZ="Asia/Taipei"
 export PYTHONPATH="/home/snow/trade-core/scripts"
 
-# FINMIND_TOKEN 從環境繼承（如 cron 環境變數有設的話）
-# 若無，wrapper 本身不改，直接 passthrough
+# ── FinMind Token（從 ~/.trade_core.env 載入）──
+if [ -f "$HOME/.trade_core.env" ]; then
+    set -a
+    source "$HOME/.trade_core.env"
+    set +a
+fi
 
 # ── Log 目錄確認 ─────────────────────────────────────────
 LOG_DIR="/home/snow/trade-core/logs"
