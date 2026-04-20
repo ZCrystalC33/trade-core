@@ -23,15 +23,18 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from collections import defaultdict
 
+import pandas as pd
+import indicators_lib as il
+
 DB_PATH = Path(__file__).parent.parent / "data" / "stock_quant.db"
 
 
 # ── 歷史資料讀取 ──────────────────────────────────────────
 
-def get_adjusted_prices(stock_id: str, start_date: str = "2020-01-01") -> list:
+def get_adjusted_prices(stock_id: str, start_date: str = "2020-01-01") -> pd.DataFrame:
     """
     優先讀取還原價格，若無則用原始價格。
-    還原價格精確匹配到小數點後兩位，讀取時保留原精度。
+    返回含 open/high/low/close/volume 的 DataFrame（由舊到新）。
     """
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -48,7 +51,7 @@ def get_adjusted_prices(stock_id: str, start_date: str = "2020-01-01") -> list:
 
     if rows:
         conn.close()
-        return [dict(r) for r in rows]
+        return pd.DataFrame([dict(r) for r in rows])
 
     # 沒有還原價格，用原始價格
     cursor.execute("""
@@ -59,109 +62,44 @@ def get_adjusted_prices(stock_id: str, start_date: str = "2020-01-01") -> list:
     """, (stock_id, start_date))
     rows = cursor.fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    return pd.DataFrame([dict(r) for r in rows])
 
 
-# ── 指標計算（純函式，不依賴實例）────────────────────────
+# ── 指標封裝（落後計算，避免偷價）────────────────────────
 
-def calc_ma(closes: list, period: int) -> list:
-    result = [None] * (period - 1)
-    for i in range(period - 1, len(closes)):
-        result.append(sum(closes[i - period + 1 : i + 1]) / period)
-    return result
-
-
-def calc_kd(highs, lows, closes, n=9):
-    k = [None] * (n - 1)
-    d = [None] * (n - 1)
-    rsv_list = []
-    for i in range(n - 1, len(closes)):
-        wh = max(highs[i - n + 1 : i + 1])
-        wl = min(lows[i - n + 1 : i + 1])
-        rsv = 50 if wh == wl else (closes[i] - wl) / (wh - wl) * 100
-        rsv_list.append(rsv)
-    if rsv_list:
-        k_val = rsv_list[0]
-        k.append(k_val)
-        d.append(k_val)
-        for i in range(1, len(rsv_list)):
-            k_val = (2/3) * k[-1] + (1/3) * rsv_list[i]
-            d_val = (2/3) * d[-1] + (1/3) * k_val
-            k.append(k_val)
-            d.append(d_val)
-    return k, d
-
-
-def calc_macd(closes, fast=12, slow=26, signal=9):
-    def ema(cols, p):
-        k = 2 / (p + 1)
-        res = [None] * (p - 1)
-        res.append(sum(cols[:p]) / p)
-        for i in range(p, len(cols)):
-            res.append(cols[i] * k + res[-1] * (1 - k))
-        return res
-    ef = ema(closes, fast)
-    es = ema(closes, slow)
-    dif = [None if ef[i] is None or es[i] is None else ef[i] - es[i] for i in range(len(closes))]
-    dea = ema([(x or 0) for x in dif], signal)
-    macd_bar = [None if dif[i] is None else 2 * (dif[i] - dea[i]) for i in range(len(dif))]
-    return dif, dea, macd_bar
-
-
-def calc_rsi(closes, period=14):
-    result = [None] * (period)
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i - 1]
-        gains.append(max(diff, 0))
-        losses.append(max(-diff, 0))
-    if len(gains) < period:
-        return result
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        if avg_loss == 0:
-            result.append(100.0)
-        else:
-            rs = avg_gain / avg_loss
-            result.append(100 - 100 / (1 + rs))
-    return result
-
-
-def indicators_at(data: list, idx: int):
-    """計算到 idx 為止的所有指標（只用 idx 之前的資料）"""
-    lookback = 120
+def indicators_at(df: pd.DataFrame, idx: int, lookback: int = 120) -> dict:
+    """
+    取到 df[idx] 為止的歷史視窗，計算落後指標，回傳最後一筆 dict。
+    實現方式：複製視窗 → add_all_indicators → 取最後一筆 → lag_indicators 落後1筆。
+    """
     start = max(0, idx - lookback)
-    window = data[start:idx + 1]
+    window = df.iloc[start:idx + 1].copy()
     if len(window) < 30:
         return None
 
-    closes = [d["close"] for d in window]
-    highs  = [d["high"]  for d in window]
-    lows   = [d["low"]   for d in window]
+    df_ind = il.add_all_indicators(window)
+    df_lag = il.lag_indicators(df_ind, n=1)
 
-    ma5   = calc_ma(closes, 5)
-    ma20  = calc_ma(closes, 20)
-    ma60  = calc_ma(closes, 60)
-    k, d  = calc_kd(highs, lows, closes)
-    dif, dea, macd_bar = calc_macd(closes)
-    rsi   = calc_rsi(closes)
-
-    def g(lst):  # get latest non-None
-        for x in reversed(lst):
-            if x is not None:
-                return x
+    # 取倒數第2筆（即 idx-1 位置，確保不用當根收盤價）
+    if len(df_lag) < 2:
         return None
+    row = df_lag.iloc[-2]  # idx-1 的落後值
 
     return {
-        "close": closes[-1],
-        "date":  window[-1]["date"],
-        "MA5":   g(ma5), "MA20":  g(ma20), "MA60":  g(ma60),
-        "K":     g(k),   "D":      g(d),
-        "DIF":   g(dif), "DEA":    g(dea),  "MACD_Bar": g(macd_bar),
-        "RSI":   g(rsi),
+        "close":  row["close"],
+        "date":   row["date"],
+        "MA5":    il.get_valid(row["MA5"]) if "MA5" in row else None,
+        "MA20":   il.get_valid(row["MA20"]) if "MA20" in row else None,
+        "MA60":   il.get_valid(row["MA60"]) if "MA60" in row else None,
+        "K":      il.get_valid(row["K"]) if "K" in row else None,
+        "D":      il.get_valid(row["D"]) if "D" in row else None,
+        "DIF":    il.get_valid(row["DIF"]) if "DIF" in row else None,
+        "DEA":    il.get_valid(row["DEA"]) if "DEA" in row else None,
+        "MACD_Bar": il.get_valid(row["MACD_Bar"]) if "MACD_Bar" in row else None,
+        "RSI":    il.get_valid(row["RSI"]) if "RSI" in row else None,
+        "BB_Upper": il.get_valid(row["BB_Upper"]) if "BB_Upper" in row else None,
+        "BB_MA":  il.get_valid(row["BB_MA"]) if "BB_MA" in row else None,
+        "BB_Lower": il.get_valid(row["BB_Lower"]) if "BB_Lower" in row else None,
     }
 
 
@@ -169,15 +107,6 @@ def indicators_at(data: list, idx: int):
 
 class Strategies:
     """策略庫"""
-
-    @staticmethod
-    def kd_gold_cross(ind) -> bool:
-        """KD 黃金交叉（K從下方穿越D）"""
-        k, d = ind["K"], ind["D"]
-        if k is None or d is None:
-            return False
-        # 需要前一根 K < D，前當根 K > D（由外層的 prev 判斷）
-        return True  # 標記為 KD_GOLD，需搭配 prev 判斷
 
     @staticmethod
     def kd_low_gold(ind) -> bool:
@@ -221,18 +150,17 @@ def backtest(strategy_name: str, stock_id: str, start_date: str,
       slippage_pct       滑價%（預設0.2%）
     """
 
-    data = get_adjusted_prices(stock_id, start_date)
-    if len(data) < 60:
-        return {"error": f"資料不足（{len(data)}筆），需要至少60筆"}
+    df = get_adjusted_prices(stock_id, start_date)
+    if len(df) < 60:
+        return {"error": f"資料不足（{len(df)}筆），需要至少60筆"}
 
     strategy_fn = {
-        "kd_cross":      Strategies.kd_low_gold,
-        "macd_bull":     Strategies.macd_bull,
-        "ma_bull":       Strategies.ma_bull,
-        "rsi_oversold":  Strategies.rsi_oversold,
-        "all":           None,
+        "kd_cross":     Strategies.kd_low_gold,
+        "macd_bull":    Strategies.macd_bull,
+        "ma_bull":      Strategies.ma_bull,
+        "rsi_oversold": Strategies.rsi_oversold,
+        "all":          None,
     }.get(strategy_name)
-
     if strategy_fn is None and strategy_name != "all":
         return {"error": f"未知策略：{strategy_name}"}
 
@@ -240,13 +168,13 @@ def backtest(strategy_name: str, stock_id: str, start_date: str,
     position = None  # {'entry_date','entry_idx','entry_price','shares'}
 
     i = 1  # 從第2根開始（有前一筆可以比較交叉）
-    while i < len(data):
-        ind = indicators_at(data, i)
+    while i < len(df):
+        ind = indicators_at(df, i)
         if ind is None:
             i += 1
             continue
 
-        prev_ind = indicators_at(data, i - 1)
+        prev_ind = indicators_at(df, i - 1)
         if prev_ind is None:
             i += 1
             continue
@@ -269,7 +197,7 @@ def backtest(strategy_name: str, stock_id: str, start_date: str,
                     triggered = strategy_fn(ind)
 
             if triggered:
-                entry_price = ind["close"] * (1 + slippage_pct)  # ，假設滑價
+                entry_price = ind["close"] * (1 + slippage_pct)  # 假設滑價
                 position = {
                     "entry_date":  ind["date"],
                     "entry_idx":   i,
@@ -282,7 +210,7 @@ def backtest(strategy_name: str, stock_id: str, start_date: str,
         else:
             exit_reason = None
             hold_days = i - position["entry_idx"]
-            current_price = data[i]["close"]
+            current_price = df.iloc[i]["close"]
 
             pnl_pct = (current_price - position["entry_price"]) / position["entry_price"]
 
@@ -302,7 +230,7 @@ def backtest(strategy_name: str, stock_id: str, start_date: str,
                     "stock_id":    stock_id,
                     "entry_date":  position["entry_date"],
                     "entry_price": position["entry_price"],
-                    "exit_date":   data[i]["date"],
+                    "exit_date":   df.iloc[i]["date"],
                     "exit_price":  exit_price,
                     "pnl_pct":     round((exit_price - position["entry_price"]) / position["entry_price"] * 100, 2),
                     "hold_days":   hold_days,
@@ -315,24 +243,24 @@ def backtest(strategy_name: str, stock_id: str, start_date: str,
 
     # 若持有到最後一天仍未出廠，記為未實現
     if position is not None:
-        last_close = data[-1]["close"]
+        last_close = df.iloc[-1]["close"]
         pnl_pct = (last_close - position["entry_price"]) / position["entry_price"] * 100
         trades.append({
             "stock_id":    stock_id,
             "entry_date":  position["entry_date"],
             "entry_price": position["entry_price"],
-            "exit_date":   data[-1]["date"],
+            "exit_date":   df.iloc[-1]["date"],
             "exit_price":  last_close,
             "pnl_pct":     round(pnl_pct, 2),
-            "hold_days":   len(data) - 1 - position["entry_idx"],
+            "hold_days":   len(df) - 1 - position["entry_idx"],
             "exit_reason": "STILL_HOLDING",
             "signal":      position["signal"],
         })
 
-    return compute_stats(trades, stock_id, strategy_name, data)
+    return compute_stats(trades, stock_id, strategy_name, df)
 
 
-def compute_stats(trades: list, stock_id: str, strategy_name: str, data: list) -> dict:
+def compute_stats(trades: list, stock_id: str, strategy_name: str, df: pd.DataFrame) -> dict:
     """計算績效統計"""
     if not trades:
         return {
@@ -430,7 +358,6 @@ if __name__ == "__main__":
     parser.add_argument("--take-profit", type=float, default=0.15)
     parser.add_argument("--max-hold", type=int, default=20)
     args = parser.parse_args()
-
     stocks = args.stock.split()
     for sid in stocks:
         result = backtest(
