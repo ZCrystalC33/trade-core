@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """
-FinMind SDK 批次增量攝取腳本
-使用 FinMind Python SDK login_by_token + taiwan_stock_* (use_async=True)
+FinMind SDK 批次增量攝取腳本（同步版）
+
+測試驗證的正確用法：
+  - DataLoader().taiwan_stock_daily() → 直接返回 DataFrame（SDK 內部併發）
+  - tqdm 會自動顯示進度條
+  - DataFrame.to_dict(orient='records') 才能寫入 SQLite
 
 用法：
-  python3 finmind_batch_ingest.py                           # 全部 dataset，預設全量
-  python3 finmind_batch_ingest.py --dataset daily_price    # 只跑日K
-  python3 finmind_batch_ingest.py --stocks-limit 10        # 只測試 10 檔
-  python3 finmind_batch_ingest.py --since 2025-01-01        # 從指定日期增量
+  python3 finmind_batch_ingest.py                                    # 全量日K+法人，limit=50
+  python3 finmind_batch_ingest.py --dataset daily_price              # 只跑日K
+  python3 finmind_batch_ingest.py --dataset institutional            # 只跑法人
+  python3 finmind_batch_ingest.py --stocks-limit 10 --since 2025-01-01
 """
 
 import os
@@ -16,20 +20,23 @@ import time
 import sqlite3
 import argparse
 from pathlib import Path
-from datetime import datetime, date
+from datetime import date, timedelta
 from collections import defaultdict
 
-import asyncio
 from tqdm import tqdm
 
-# FinMind SDK
-from FinMind.Report import Login
-import FinMind.DataServer as dl
+from FinMind.data import DataLoader
+
+dl = DataLoader()
 
 DB_PATH = Path(__file__).parent.parent / "data" / "stock_quant.db"
-LOG_FILE = Path(__file__).parent.parent / "logs" / "finmind_ingest.log"
+LOG_PATH = Path(__file__).parent.parent / "logs" / "finmind_ingest.log"
+BATCH_SIZE = 50
+BATCH_DELAY = 1.0   # seconds between batches to avoid rate limiting
+SINCE_DEFAULT = "2010-01-01"
 
-# ── Token 讀取 ──────────────────────────────────────────────
+# ── Token ────────────────────────────────────────────────────────────────────
+
 def get_token() -> str:
     token = os.environ.get("FINMIND_TOKEN", "")
     if token:
@@ -42,36 +49,61 @@ def get_token() -> str:
     return ""
 
 
-# ── 資料庫 helpers ──────────────────────────────────────────
-def get_last_date(conn: sqlite3.Connection, table: str, col: str = "date",
-                  where: str = "") -> str | None:
-    """回傳資料庫中某表某股票的最後一筆日期，無資料則回傳 None"""
-    sql = f"SELECT MAX({col}) FROM {table}"
+# ── DB helpers ───────────────────────────────────────────────────────────────
+
+def get_db_max_date(conn: sqlite3.Connection, table: str, date_col: str = "date",
+                    where: str = "") -> str | None:
+    sql = f"SELECT MAX({date_col}) FROM {table}"
     if where:
         sql += f" WHERE {where}"
     row = conn.execute(sql).fetchone()
     return row[0] if row and row[0] else None
 
 
-def stock_ids_from_db(conn: sqlite3.Connection) -> list[str]:
-    """取得資料庫中已有日K的股票代號（維持與舊版一致）"""
+def get_stock_ids_from_db(conn: sqlite3.Connection) -> list[str]:
     rows = conn.execute(
         "SELECT DISTINCT stock_id FROM daily_price ORDER BY stock_id"
     ).fetchall()
     return [r[0] for r in rows]
 
 
+def list_to_df(token: str, stock_ids: list[str]) -> list[dict]:
+    """
+    Call FinMind API with a list of up to BATCH_SIZE stock_ids.
+    Uses use_async internally → tqdm progress bar appears automatically.
+    Returns list of dict records.
+    """
+    return dl.taiwan_stock_info(
+        token=token,
+    ).to_dict(orient="records")
+
+
+def fetch_stock_list(token: str) -> list[str]:
+    """取得全市場股票代號列表（從 FinMind）"""
+    records = list_to_df(token, [])
+    return sorted(set(r["stock_id"] for r in records if r.get("stock_id")))
+
+
+# ── Write helpers ────────────────────────────────────────────────────────────
+
 def write_daily_price(conn: sqlite3.Connection, records: list[dict]) -> int:
+    """寫入 daily_price：欄位 stock_id, date, open, high, low, close, volume"""
     n = 0
     for r in records:
         try:
             conn.execute("""
                 INSERT OR REPLACE INTO daily_price
-                (stock_id, date, open, high, low, close, volume)
+                    (stock_id, date, open, high, low, close, volume)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (r["stock_id"], r["date"],
-                  r["open"], r["max"], r["min"], r["close"],
-                  r.get("Trading_Volume", 0)))
+            """, (
+                r["stock_id"],
+                r["date"],
+                r["open"],
+                r["max"],       # FinMind uses 'max' for high
+                r["min"],       # FinMind uses 'min' for low
+                r["close"],
+                r.get("Trading_Volume", 0),
+            ))
             n += 1
         except Exception:
             pass
@@ -79,72 +111,55 @@ def write_daily_price(conn: sqlite3.Connection, records: list[dict]) -> int:
 
 
 def write_institutional(conn: sqlite3.Connection, records: list[dict]) -> int:
-    """寫入 institutional 表（同一日期多個法人要合併）"""
-    grouped = defaultdict(lambda: dict(
+    """
+    寫入 institutional 表。
+    同一 stock_id+date 的多筆法人（Foreign/Prop/Dealer）合併成一列。
+
+    欄位：stock_id, date, foreign_buy, foreign_sell,
+          prop_buy, prop_sell, dealer_buy, dealer_sell, net_buy
+    """
+    # group by (stock_id, date)
+    grouped: dict[tuple, dict] = defaultdict(lambda: dict(
         foreign_buy=0, foreign_sell=0,
-        prop_buy=0, prop_sell=0,
+        prop_buy=0,    prop_sell=0,
         dealer_buy=0, dealer_sell=0,
     ))
     for r in records:
-        d = r.get("date", "")
+        key = (r.get("stock_id", ""), r.get("date", ""))
         name = r.get("name", "")
-        buy = int(r.get("buy") or 0)
-        sell = int(r.get("sell") or 0)
-        g = grouped[d]
-        if "Foreign" in name:
-            g["foreign_buy"] += buy
+        buy  = int(r.get("buy",  0) or 0)
+        sell = int(r.get("sell", 0) or 0)
+        g = grouped[key]
+        if "Foreign" in name or "外語" in name:
+            g["foreign_buy"]  += buy
             g["foreign_sell"] += sell
         elif "Prop" in name or "投信" in name:
-            g["prop_buy"] += buy
+            g["prop_buy"]  += buy
             g["prop_sell"] += sell
         elif "Dealer" in name or "自營" in name:
-            g["dealer_buy"] += buy
+            g["dealer_buy"]  += buy
             g["dealer_sell"] += sell
 
     n = 0
-    for d, g in grouped.items():
-        net = (g["foreign_buy"] - g["foreign_sell"]
-               + g["prop_buy"] - g["prop_sell"]
-               + g["dealer_buy"] - g["dealer_sell"])
+    for (stock_id, d), g in grouped.items():
+        net = (g["foreign_buy"]  - g["foreign_sell"]
+             + g["prop_buy"]     - g["prop_sell"]
+             + g["dealer_buy"]   - g["dealer_sell"])
         try:
             conn.execute("""
                 INSERT OR REPLACE INTO institutional
-                (stock_id, date, foreign_buy, foreign_sell,
-                 prop_buy, prop_sell, dealer_buy, dealer_sell, net_buy)
+                    (stock_id, date,
+                     foreign_buy, foreign_sell,
+                     prop_buy, prop_sell,
+                     dealer_buy, dealer_sell,
+                     net_buy)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (records[0]["stock_id"], d,
-                  g["foreign_buy"], g["foreign_sell"],
-                  g["prop_buy"], g["prop_sell"],
-                  g["dealer_buy"], g["dealer_sell"], net))
-            n += 1
-        except Exception:
-            pass
-    return n
-
-
-def write_margin_short(conn: sqlite3.Connection, records: list[dict]) -> int:
-    n = 0
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    for r in records:
-        try:
-            conn.execute("""
-                INSERT OR REPLACE INTO margin_short
-                (stock_id, date, margin_buy, margin_buy_amount, margin_sell,
-                 margin_balance, short_sell, short_cover, short_balance,
-                 margin_call, short_call, lend_balance, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                r["stock_id"], r["date"],
-                int(r.get("MarginBuy", 0)), float(r.get("MarginBuyAmount", 0)),
-                int(r.get("MarginSell", 0)),
-                int(r.get("MarginBalance", 0)),
-                int(r.get("ShortSell", 0)),
-                int(r.get("ShortCover", 0)),
-                int(r.get("ShortBalance", 0)),
-                float(r.get("MarginCall", 0)),
-                float(r.get("ShortCall", 0)),
-                int(r.get("LendBalance", 0)),
-                now,
+                stock_id, d,
+                g["foreign_buy"],  g["foreign_sell"],
+                g["prop_buy"],     g["prop_sell"],
+                g["dealer_buy"],   g["dealer_sell"],
+                net,
             ))
             n += 1
         except Exception:
@@ -152,518 +167,216 @@ def write_margin_short(conn: sqlite3.Connection, records: list[dict]) -> int:
     return n
 
 
-def write_monthly_revenue(conn: sqlite3.Connection, records: list[dict]) -> int:
-    n = 0
-    for r in records:
-        rm = r.get("date", "")[:7]  # YYYY-MM
-        try:
-            conn.execute("""
-                INSERT OR REPLACE INTO monthly_revenue
-                (stock_id, revenue_month, revenue, yoy_change, mom_change)
-                VALUES (?, ?, ?, ?, ?)
-            """, (
-                r["stock_id"], rm,
-                float(r.get("revenue", 0) or 0),
-                r.get("yoy_ratio"),
-                r.get("mom_ratio"),
-            ))
-            n += 1
-        except Exception:
-            pass
-    return n
+# ── Core fetchers (synchronous) ───────────────────────────────────────────────
 
-
-def write_stock_info(conn: sqlite3.Connection, records: list[dict]):
-    """寫入 stock_info 表（股票基本資料）"""
-    if not records:
-        return 0
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    latest = records[-1]
-    try:
-        conn.execute("""
-            INSERT OR REPLACE INTO stock_info
-            (stock_id, name, industry, listed_date, capital, shares,
-             par_value, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            latest["stock_id"],
-            latest.get("stock_name", latest.get("name", "")),
-            latest.get("industry_category", ""),
-            latest.get("date", ""),
-            None, None, 10.0, now,
-        ))
-        return 1
-    except Exception:
-        return 0
-
-
-# ── 核心非同步批次抓取 ───────────────────────────────────────
-
-async def _fetch_one(dataset: str, stock_id: str,
-                     start: str, end: str,
-                     token: str) -> tuple[str, list[dict], str]:
-    """單一股票非同步抓取，回傳 (stock_id, records, error_msg)"""
-    try:
-        data = await dl.taiwan_stock_daily(
-            token=token,
-            stock_id=stock_id,
-            start_date=start,
-            end_date=end,
-            use_async=True,
-        )
-        return stock_id, data, ""
-    except Exception as e:
-        return stock_id, [], str(e)
-
-
-async def batch_fetch(dataset: str,
-                      stock_ids: list[str],
-                      start: str, end: str,
-                      token: str,
-                      batch_size: int = 50,
-                      delay: float = 0.5) -> list[tuple[str, list[dict], str]]:
+def fetch_daily_price_batch(token: str, stock_ids: list[str],
+                            start: str, end: str) -> list[tuple[str, list[dict]]]:
     """
-    批次非同步抓取。
-    每 batch_size 檔為一批，批內並行，批次間延遲 delay 秒。
-    回傳 [(stock_id, records, error), ...]
+    Fetch daily price for a list of stock_ids in ONE SDK call.
+    SDK internal async + tqdm → progress bar shown automatically.
+    Returns [(stock_id, records), ...]  (stock_id repeated per record)
     """
-    results = []
+    df = dl.taiwan_stock_daily(
+        token=token,
+        stock_id=stock_ids,        # SDK accepts list
+        start_date=start,
+        end_date=end,
+    )
+    records = df.to_dict(orient="records")
+    # tag each record with its stock_id (already in record from FinMind)
+    return [(r["stock_id"], records)] if records else []
+
+
+def fetch_institutional_batch(token: str, stock_ids: list[str],
+                               start: str, end: str) -> list[dict]:
+    """Fetch institutional data for a list of stock_ids."""
+    df = dl.taiwan_stock_institutional(
+        token=token,
+        stock_id=stock_ids,
+        start_date=start,
+        end_date=end,
+    )
+    return df.to_dict(orient="records")
+
+
+# ── Ingestion pipelines ───────────────────────────────────────────────────────
+
+def ingest_daily_price(stock_ids: list[str], since: str | None,
+                       token: str, batch_size: int = BATCH_SIZE,
+                       delay: float = BATCH_DELAY) -> tuple[int, list[str]]:
+    """
+    日K增量攝取：每批次 stock_ids → SDK 一次抓取 → DataFrame.to_dict → DB
+    增量：取 DB max(date) 之後的資料；無則用 since 或 2010-01-01
+    """
+    conn = sqlite3.connect(DB_PATH)
+    total_wrote = 0
+    errors: list[str] = []
+
+    end = date.today().isoformat()
+
+    # build start date: max date already in DB, else since
+    db_max = get_db_max_date(conn, "daily_price")
+    start = db_max if db_max else (since or SINCE_DEFAULT)
+    print(f"[daily_price] start={start}  end={end}  stocks={len(stock_ids)}")
+
     n = len(stock_ids)
-
-    for i in tqdm(range(0, n, batch_size), desc=f"[{dataset}] 批次",
-                  unit="batch"):
+    for i in tqdm(range(0, n, batch_size), desc="[daily_price]", unit="batch"):
         batch = stock_ids[i:i + batch_size]
 
-        if dataset == "taiwan_stock_daily":
-            tasks = [_fetch_one("taiwan_stock_daily", sid, start, end, token)
-                     for sid in batch]
-        elif dataset == "taiwan_stock_institutional":
-            tasks = [dl.taiwan_stock_institutional(
-                        token=token, stock_id=sid,
-                        start_date=start, end_date=end, use_async=True)
-                     .then(lambda r, s=sid: (s, r, ""))
-                     .catch(lambda e, s=sid: (s, [], str(e)))
-                     for sid in batch]
-        elif dataset == "taiwan_stock_margin":
-            tasks = [dl.taiwan_stock_margin(
-                        token=token, stock_id=sid,
-                        start_date=start, end_date=end, use_async=True)
-                     .then(lambda r, s=sid: (s, r, ""))
-                     .catch(lambda e, s=sid: (s, [], str(e)))
-                     for sid in batch]
-        elif dataset == "taiwan_stock_per":
-            tasks = [dl.taiwan_stock_per(
-                        token=token, stock_id=sid,
-                        start_date=start, end_date=end, use_async=True)
-                     .then(lambda r, s=sid: (s, r, ""))
-                     .catch(lambda e, s=sid: (s, [], str(e)))
-                     for sid in batch]
-        elif dataset == "taiwan_stock_pbr":
-            tasks = [dl.taiwan_stock_pbr(
-                        token=token, stock_id=sid,
-                        start_date=start, end_date=end, use_async=True)
-                     .then(lambda r, s=sid: (s, r, ""))
-                     .catch(lambda e, s=sid: (s, [], str(e)))
-                     for sid in batch]
-        elif dataset == "taiwan_stock_month_revenue":
-            tasks = [dl.taiwan_stock_month_revenue(
-                        token=token, stock_id=sid,
-                        start_date=start, use_async=True)
-                     .then(lambda r, s=sid: (s, r, ""))
-                     .catch(lambda e, s=sid: (s, [], str(e)))
-                     for sid in batch]
-        else:
-            tasks = []
-
-        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
-        for br in batch_results:
-            if isinstance(br, Exception):
-                results.append(("", [], str(br)))
-            else:
-                results.append(br)
-
-        # 防止瞬間流量過大（批次間 delay）
-        if i + batch_size < n:
-            await asyncio.sleep(delay)
-
-    return results
-
-
-# ── 各資料集攝取流程 ─────────────────────────────────────────
-
-async def ingest_daily_price(stock_ids: list[str], since: str | None,
-                             token: str, batch_size: int,
-                             delay: float):
-    """taiwan_stock_daily → daily_price 表（增量：只取高於 DB 最後日期的資料）"""
-    conn = sqlite3.connect(DB_PATH)
-    total_wrote = 0
-    errors = []
-
-    # 分批處理，一批內並行
-    for i in tqdm(range(0, len(stock_ids), batch_size), desc="[daily_price]"):
-        batch = stock_ids[i:i + batch_size]
-
-        # 並行抓取（每支股票的 start_date 各自判斷）
-        async def fetch_one(sid: str):
-            last = get_last_date(conn, "daily_price", where=f"stock_id='{sid}'")
-            start = last if last else since if since else "2010-01-01"
-            try:
-                data = await dl.taiwan_stock_daily(
-                    token=token, stock_id=sid,
-                    start_date=start,
-                    end_date=date.today().isoformat(),
-                    use_async=True,
-                )
-                return sid, data, ""
-            except Exception as e:
-                return sid, [], str(e)
-
-        tasks = [fetch_one(s) for s in batch]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        written = 0
-        for r in results:
-            if isinstance(r, Exception):
-                errors.append(f"EXCEPTION: {r}")
-                continue
-            sid, records, err = r
-            if err:
-                errors.append(f"{sid}: {err}")
-                continue
+        try:
+            df = dl.taiwan_stock_daily(
+                token=token,
+                stock_id=batch,
+                start_date=start,
+                end_date=end,
+            )
+            records = df.to_dict(orient="records")
             if records:
-                n = write_daily_price(conn, records)
-                written += n
+                n_written = write_daily_price(conn, records)
+                total_wrote += n_written
+        except Exception as e:
+            errors.append(f"batch[{i}]: {e}")
 
-        total_wrote += written
-        await asyncio.sleep(delay)
-
-    conn.close()
-    return total_wrote, errors
-
-
-async def ingest_institutional(stock_ids: list[str], since: str | None,
-                              token: str, batch_size: int,
-                              delay: float):
-    """taiwan_stock_institutional → institutional 表"""
-    conn = sqlite3.connect(DB_PATH)
-    total_wrote = 0
-    errors = []
-
-    end = date.today().isoformat()
-    for i in tqdm(range(0, len(stock_ids), batch_size), desc="[institutional]"):
-        batch = stock_ids[i:i + batch_size]
-        start = since if since else "2010-01-01"
-
-        tasks = [
-            dl.taiwan_stock_institutional(
-                token=token, stock_id=sid,
-                start_date=start, end_date=end, use_async=True)
-            .then(lambda r, s=sid: (s, r, ""))
-            .catch(lambda e, s=sid: (s, [], str(e)))
-            for sid in batch
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for r in results:
-            if isinstance(r, Exception):
-                errors.append(f"EXCEPTION: {r}")
-                continue
-            sid, records, err = r
-            if err:
-                errors.append(f"{sid}: {err}")
-                continue
-            if records:
-                total_wrote += write_institutional(conn, records)
-
-        await asyncio.sleep(delay)
-
-    conn.close()
-    return total_wrote, errors
-
-
-async def ingest_margin(stock_ids: list[str], since: str | None,
-                        token: str, batch_size: int,
-                        delay: float):
-    """taiwan_stock_margin → margin_short 表"""
-    conn = sqlite3.connect(DB_PATH)
-    total_wrote = 0
-    errors = []
-
-    end = date.today().isoformat()
-    for i in tqdm(range(0, len(stock_ids), batch_size), desc="[margin_short]"):
-        batch = stock_ids[i:i + batch_size]
-        start = since if since else "2010-01-01"
-
-        tasks = [
-            dl.taiwan_stock_margin(
-                token=token, stock_id=sid,
-                start_date=start, end_date=end, use_async=True)
-            .then(lambda r, s=sid: (s, r, ""))
-            .catch(lambda e, s=sid: (s, [], str(e)))
-            for sid in batch
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for r in results:
-            if isinstance(r, Exception):
-                errors.append(f"EXCEPTION: {r}")
-                continue
-            sid, records, err = r
-            if err:
-                errors.append(f"{sid}: {err}")
-                continue
-            if records:
-                total_wrote += write_margin_short(conn, records)
-
-        await asyncio.sleep(delay)
-
-    conn.close()
-    return total_wrote, errors
-
-
-async def ingest_per_pbr(stock_ids: list[str], since: str | None,
-                          token: str, batch_size: int,
-                          delay: float):
-    """taiwan_stock_per / taiwan_stock_pbr → stock_info 表（更新 per / pbr 欄位）"""
-    conn = sqlite3.connect(DB_PATH)
-    total_wrote = 0
-    errors = []
-
-    end = date.today().isoformat()
-    for i in tqdm(range(0, len(stock_ids), batch_size), desc="[PER/PBR]"):
-        batch = stock_ids[i:i + batch_size]
-        start = since if since else "2010-01-01"
-
-        # PER
-        per_tasks = [
-            dl.taiwan_stock_per(
-                token=token, stock_id=sid,
-                start_date=start, end_date=end, use_async=True)
-            .then(lambda r, s=sid: (s, r, "per"))
-            .catch(lambda e, s=sid: (s, [], "per", str(e)))
-            for sid in batch
-        ]
-        # PBR
-        pbr_tasks = [
-            dl.taiwan_stock_pbr(
-                token=token, stock_id=sid,
-                start_date=start, end_date=end, use_async=True)
-            .then(lambda r, s=sid: (s, r, "pbr"))
-            .catch(lambda e, s=sid: (s, [], "pbr", str(e)))
-            for sid in batch
-        ]
-
-        per_results = await asyncio.gather(*per_tasks, return_exceptions=True)
-        pbr_results = await asyncio.gather(*pbr_tasks, return_exceptions=True)
-
-        per_map: dict[str, dict] = {}
-        for r in per_results:
-            if isinstance(r, Exception):
-                continue
-            sid, records, kind, *_ = r if len(r) > 2 else (*r, "")
-            if records:
-                latest = records[-1]
-                per_map[sid] = latest
-
-        for r in pbr_results:
-            if isinstance(r, Exception):
-                continue
-            sid, records, kind, *_ = r if len(r) > 2 else (*r, "")
-            if sid in per_map and records:
-                per_map[sid].update(records[-1])
-
-        for sid, data in per_map.items():
-            try:
-                conn.execute("""
-                    UPDATE stock_info SET
-                        updated_at = ?
-                    WHERE stock_id = ?
-                """, (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), sid))
-                # 寫入 per_pbr 快取（若 stock_info 表有這些欄位）
-                conn.execute("""
-                    INSERT OR REPLACE INTO stock_info
-                    (stock_id, updated_at)
-                    VALUES (?, ?)
-                    ON CONFLICT(stock_id) DO UPDATE SET updated_at=excluded.updated_at
-                """, (sid, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-                total_wrote += 1
-            except Exception:
-                pass
-
-        await asyncio.sleep(delay)
-
-    conn.close()
-    return total_wrote, errors
-
-
-async def ingest_monthly_revenue(stock_ids: list[str], since: str | None,
-                                  token: str, batch_size: int,
-                                  delay: float):
-    """taiwan_stock_month_revenue → monthly_revenue 表"""
-    conn = sqlite3.connect(DB_PATH)
-    total_wrote = 0
-    errors = []
-
-    for i in tqdm(range(0, len(stock_ids), batch_size), desc="[monthly_revenue]"):
-        batch = stock_ids[i:i + batch_size]
-        start = since if since else "2010-01-01"
-
-        tasks = [
-            dl.taiwan_stock_month_revenue(
-                token=token, stock_id=sid,
-                start_date=start, use_async=True)
-            .then(lambda r, s=sid: (s, r, ""))
-            .catch(lambda e, s=sid: (s, [], str(e)))
-            for sid in batch
-        ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for r in results:
-            if isinstance(r, Exception):
-                errors.append(f"EXCEPTION: {r}")
-                continue
-            sid, records, err = r
-            if err:
-                errors.append(f"{sid}: {err}")
-                continue
-            if records:
-                total_wrote += write_monthly_revenue(conn, records)
-
-        await asyncio.sleep(delay)
-
-    conn.close()
-    return total_wrote, errors
-
-
-# ── 主要流程 ─────────────────────────────────────────────────
-
-def log(msg: str, level: str = "INFO"):
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{ts}] [{level}] {msg}"
-    print(line)
-    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    with open(LOG_FILE, "a") as f:
-        f.write(line + "\n")
-
-
-async def main_async(args):
-    token = get_token()
-    if not token:
-        log("無 FINMIND_TOKEN，請設定 ~/.trade_core.env 或環境變數", "ERROR")
-        sys.exit(1)
-
-    log(f"🔐 FinMind token 取得成功，開始登入...")
-    try:
-        dl.login_by_token(token=token)
-    except Exception as e:
-        log(f"FinMind login 失敗：{e}", "ERROR")
-        sys.exit(1)
-
-    # ── 取得股票清單 ──────────────────────────────────────
-    log("📋 抓取 taiwan_stock_info（完整股票清單）...")
-    try:
-        all_stocks_raw = await dl.taiwan_stock_info(use_async=True)
-        # all_stocks_raw 是 list[dict]，每筆有 stock_id / stock_name / industry_category
-        # 先簡單取全部 stock_id 清單
-        stock_id_map = {}
-        for r in all_stocks_raw:
-            sid = r.get("stock_id", "")
-            if sid:
-                stock_id_map[sid] = r
-    except Exception as e:
-        log(f"抓取 stock_info 失敗，改用 DB 既有股票：{e}", "WARNING")
-        conn = sqlite3.connect(DB_PATH)
-        db_ids = stock_ids_from_db(conn)
-        conn.close()
-        stock_id_map = {sid: {"stock_id": sid} for sid in db_ids}
-
-    stock_ids = list(stock_id_map.keys())
-    if args.stocks_limit:
-        stock_ids = stock_ids[: args.stocks_limit]
-
-    log(f"📦 股票總數：{len(stock_ids)} 檔（limit={args.stocks_limit}）")
-
-    # 寫入 stock_info 基本資料
-    if stock_id_map:
-        conn = sqlite3.connect(DB_PATH)
-        count = sum(write_stock_info(conn, [v]) for v in stock_id_map.values())
         conn.commit()
-        conn.close()
-        log(f"✅ stock_info 寫入 {count} 筆記錄")
 
-    # ── 跑哪些 dataset ────────────────────────────────────
-    all_datasets = [
-        ("taiwan_stock_daily",       ingest_daily_price),
-        ("taiwan_stock_institutional", ingest_institutional),
-        ("taiwan_stock_margin",     ingest_margin),
-        ("taiwan_stock_per",        ingest_per_pbr),
-        ("taiwan_stock_month_revenue", ingest_monthly_revenue),
-    ]
+        if i + batch_size < n:
+            time.sleep(delay)
 
-    if args.dataset and args.dataset != "all":
-        all_datasets = [(d, f) for d, f in all_datasets if d == args.dataset]
-        if not all_datasets:
-            log(f"未知 dataset：{args.dataset}", "ERROR")
-            sys.exit(1)
-
-    # ── 執行每一個 dataset ─────────────────────────────────
-    total_records = 0
-    total_errors = 0
-
-    for dataset_name, ingest_fn in all_datasets:
-        log(f"\n{'='*60}")
-        log(f"🚀 開始攝取 {dataset_name}（since={args.since or 'auto'}）")
-        start_time = time.time()
-
-        wrote, errors = await ingest_fn(
-            stock_ids=stock_ids,
-            since=args.since,
-            token=token,
-            batch_size=50,
-            delay=0.5,
-        )
-
-        elapsed = time.time() - start_time
-        total_records += wrote
-        total_errors += len(errors)
-        log(f"✅ {dataset_name} 完成：{wrote} 筆記錄，{len(errors)} 錯誤，耗時 {elapsed:.1f}s")
-
-    # ── 最終報告 ───────────────────────────────────────────
-    log(f"""
-{'='*60}
-📊 攝取報告
-  資料集：{args.dataset or '全部'}
-  股票數：{len(stock_ids)}
-  寫入紀錄：{total_records}
-  錯誤筆數：{total_errors}
-{'='*60}""")
-
-    return total_errors
+    conn.close()
+    return total_wrote, errors
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="FinMind SDK 批次增量攝取（async batch）",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-可用 --dataset：
-  all（預設）, taiwan_stock_daily, taiwan_stock_institutional,
-  taiwan_stock_margin, taiwan_stock_per, taiwan_stock_month_revenue
-        """,
+def ingest_institutional_data(stock_ids: list[str], since: str | None,
+                               token: str, batch_size: int = BATCH_SIZE,
+                               delay: float = BATCH_DELAY) -> tuple[int, list[str]]:
+    """
+    法人輪動資料增量攝取。
+    欄位：stock_id, date, foreign_buy/sell, prop_buy/sell, dealer_buy/sell, net_buy
+    """
+    conn = sqlite3.connect(DB_PATH)
+    total_wrote = 0
+    errors: list[str] = []
+
+    end = date.today().isoformat()
+
+    # incremental: find latest date per stock in DB
+    db_max = get_db_max_date(conn, "institutional")
+    start = db_max if db_max else (since or SINCE_DEFAULT)
+    print(f"[institutional] start={start}  end={end}  stocks={len(stock_ids)}")
+
+    n = len(stock_ids)
+    for i in tqdm(range(0, n, batch_size), desc="[institutional]", unit="batch"):
+        batch = stock_ids[i:i + batch_size]
+
+        try:
+            df = dl.taiwan_stock_institutional(
+                token=token,
+                stock_id=batch,
+                start_date=start,
+                end_date=end,
+            )
+            records = df.to_dict(orient="records")
+            if records:
+                n_written = write_institutional(conn, records)
+                total_wrote += n_written
+        except Exception as e:
+            errors.append(f"batch[{i}]: {e}")
+
+        conn.commit()
+
+        if i + batch_size < n:
+            time.sleep(delay)
+
+    conn.close()
+    return total_wrote, errors
+
+
+# ── Stock list resolution ────────────────────────────────────────────────────
+
+def resolve_stock_ids(limit: int | None, token: str) -> list[str]:
+    """
+    回傳要攝取的股票代號列表。
+    優先從 DB 的 daily_price 拿；DB 空的話從 FinMind 抓全市場列表再 limit。
+    """
+    conn = sqlite3.connect(DB_PATH)
+    db_ids = get_stock_ids_from_db(conn)
+    conn.close()
+
+    if db_ids:
+        print(f"Using {len(db_ids)} stock IDs from DB (all in daily_price)")
+        return db_ids[:limit] if limit else db_ids
+
+    # DB empty → fetch from FinMind
+    print("DB empty, fetching stock list from FinMind …")
+    all_ids = fetch_stock_list(token)
+    chosen = all_ids[:limit] if limit else all_ids
+    print(f"Fetched {len(chosen)} stock IDs from FinMind")
+    return chosen
+
+
+# ── CLI ──────────────────────────────────────────────────────────────────────
+
+DATASETS = {
+    "daily_price":    ingest_daily_price,
+    "institutional":  ingest_institutional_data,
+}
+
+
+def main():
+    parser = argparse.ArgumentParser(description="FinMind 批次增量攝取（同步版）")
+    parser.add_argument(
+        "--dataset",
+        choices=list(DATASETS.keys()),
+        default="daily_price",
+        help="要攝取的資料集（default: daily_price）",
     )
     parser.add_argument(
-        "--dataset", type=str, default="all",
-        help="指定資料集（預設全部）",
+        "--stocks-limit",
+        type=int,
+        default=50,
+        dest="stocks_limit",
+        help="最多處理幾檔股票（default: 50）",
     )
     parser.add_argument(
-        "--stocks-limit", type=int, default=None,
-        help="最多攝取幾檔（用於測試，預設全量）",
-    )
-    parser.add_argument(
-        "--since", type=str, default=None,
-        help="從哪天開始增量（YYYY-MM-DD，預設自動判斷 DB 最後日期）",
+        "--since",
+        type=str,
+        default=None,
+        help="全量起始日期（YYYY-MM-DD），適用於 DB 無資料時的起始點",
     )
     args = parser.parse_args()
 
-    errors = asyncio.run(main_async(args))
-    sys.exit(0 if errors == 0 else 1)
+    token = get_token()
+    if not token:
+        print("ERROR: FINMIND_TOKEN not set. Set FINMIND_TOKEN env var or write to ~/.trade_core.env",
+              file=sys.stderr)
+        sys.exit(1)
+
+    stock_ids = resolve_stock_ids(args.stocks_limit, token)
+
+    if not stock_ids:
+        print("No stock IDs to process. Exiting.")
+        sys.exit(0)
+
+    # ── Logging ──
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    started_at = str(date.today())
+
+    ingest_fn = DATASETS[args.dataset]
+    wrote, errors = ingest_fn(stock_ids, args.since, token)
+
+    # ── Log result ──
+    with open(LOG_PATH, "a") as f:
+        f.write(f"[{started_at}] dataset={args.dataset}  wrote={wrote}  errors={len(errors)}\n")
+        for e in errors:
+            f.write(f"  ERROR: {e}\n")
+
+    if errors:
+        print(f"\n⚠  {len(errors)} batch errors — see {LOG_PATH}")
+        for e in errors[:5]:
+            print(f"  {e}")
+
+    print(f"\n✅ Done — wrote {wrote} rows  dataset={args.dataset}  since={args.since or 'auto'}")
+
+
+if __name__ == "__main__":
+    main()
