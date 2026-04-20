@@ -10,6 +10,13 @@ import json
 from pathlib import Path
 from technical_indicators import generate_signals, get_price_data
 
+try:
+    import jin10_client as jc
+    JIN10_AVAILABLE = True
+except ImportError:
+    JIN10_AVAILABLE = False
+    jc = None
+
 DB_PATH = Path(__file__).parent.parent / "data" / "stock_quant.db"
 
 
@@ -150,11 +157,30 @@ def scan_ma_bull排列() -> list:
 
 
 def run_all_scans() -> dict:
-    """一口氣跑所有掃描，回傳結果"""
+    """一口氣跑所有掃描，回傳結果（含 Jin10 宏觀警訊）"""
     print("🔍 Stephanie 股票掃描器")
     print("=" * 50)
 
     results = {}
+
+    # ── 宏觀前置檢查 ────────────────────────────────────────
+    if JIN10_AVAILABLE:
+        try:
+            macro_score = jc.get_macro_sentiment()
+            macro_flag = jc.check_macro_threshold(macro_score)
+            print(f"\n🌐 宏觀情緒：{macro_score:.1f}/100  [{macro_flag}]")
+
+            alert = jc.check_macro_alerts()
+            if alert:
+                print(f"  {alert}")
+        except Exception as e:
+            macro_score = None
+            macro_flag = "N/A"
+            print(f"\n⚠️  宏觀數據取得失敗：{e}")
+    else:
+        macro_score = None
+        macro_flag = "N/A"
+        print("\n⚠️  Jin10 未啟用（未安裝或無法載入）")
 
     print("\n📌 掃描 1：KD 黃金交叉（低檔）")
     print("-" * 40)
@@ -184,8 +210,19 @@ def run_all_scans() -> dict:
     for i, c in enumerate(ma[:10], 1):
         print(f"  {i}. {c['stock_id']} 收{c['close']} | MA5={c['MA5']} MA20={c['MA20']} MA60={c['MA60']} | 評分{c['score']}/10")
 
-    print(f"\n{'='*50}")
-    print("✅ 掃描完成")
+    # ── 宏觀結論 ───────────────────────────────────────────
+    if macro_flag != "N/A":
+        print(f"\n{'='*50}")
+        if macro_flag == "BULL":
+            print("✅ 宏觀偏多，策略積極（可參考推薦股票）")
+        elif macro_flag == "BEAR":
+            print("⚠️  宏觀偏空，策略謹慎（注意倉位控制）")
+        else:
+            print("➡️  宏觀中性，觀望為主")
+        print("✅ 掃描完成")
+    else:
+        print(f"\n{'='*50}")
+        print("✅ 掃描完成")
     return results
 
 

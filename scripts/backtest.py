@@ -33,7 +33,17 @@ import pandas as pd
 import indicators_lib as il
 import cost_model as cm
 
+try:
+    import jin10_client as jc
+    JIN10_AVAILABLE = True
+except ImportError:
+    JIN10_AVAILABLE = False
+
 DB_PATH = Path(__file__).parent.parent / "data" / "stock_quant.db"
+
+# ── 宏觀參數 ─────────────────────────────────────────────
+MACRO_BULL_THRESHOLD = 55.0   # 宏觀分數 >= 此值才允許做多
+MACRO_BEAR_THRESHOLD = 45.0   # 宏觀分數 <= 此值才允許做空
 
 
 # ── 歷史資料讀取 ──────────────────────────────────────────
@@ -220,6 +230,35 @@ def backtest(strategy_name: str, stock_id: str, start_date: str,
                     triggered = strategy_fn(ind)
 
             if triggered:
+                # ── 宏觀維度過濾 ────────────────────────────────
+                # 只在 Jin10 可用時才應用，避免影響無法連線時的原有邏輯
+                macro_filter_passed = True
+                if JIN10_AVAILABLE:
+                    try:
+                        macro_score = jc.get_macro_sentiment()
+                        macro_flag = jc.check_macro_threshold(
+                            macro_score,
+                            bull_threshold=MACRO_BULL_THRESHOLD,
+                            bear_threshold=MACRO_BEAR_THRESHOLD,
+                        )
+                        # LONG 訊號需要宏觀 BULL，SHORT 訊號需要 BEAR
+                        # 多頭策略（kd_cross, macd_bull, ma_bull）預設是 LONG
+                        # 若宏觀不支持則跳過這筆進場
+                        if strategy_name in ("kd_cross", "macd_bull", "ma_bull", "all"):
+                            if macro_flag != "BULL":
+                                macro_filter_passed = False
+                    except Exception:
+                        # 宏觀API失效時，放行所有進場（不鎖死系統）
+                        macro_score = None
+                        macro_flag = "UNKNOWN"
+                else:
+                    macro_score = None
+                    macro_flag = "N/A"
+
+                if not macro_filter_passed:
+                    i += 1
+                    continue  # 宏觀不支持，跳過此次進場
+
                 # 進場價：信號收盤價 + 滑價（下一根開盤的近似估計）
                 entry_price = ind["close"] * (1 + slippage_pct)
                 # 真實成本價：進場價 + 單邊進場手續費
@@ -232,6 +271,8 @@ def backtest(strategy_name: str, stock_id: str, start_date: str,
                     "cost_basis":  cost_basis,  # 進場價 × (1 + one_way_rate)
                     "signal":      strategy_name,
                     "reason":      f"{ind['date']} {stock_id} 進場",
+                    "macro_score": macro_score,
+                    "macro_flag":  macro_flag,
                 }
 
         # 持有中 → 檢查停損/停利/到期
@@ -259,9 +300,7 @@ def backtest(strategy_name: str, stock_id: str, start_date: str,
                 exit_reason = "TIME_UP"
 
             if exit_reason:
-                # 出場價：含滑價
                 exit_price = current_price * (1 - slippage_pct)
-                # 淨損益率：已扣除來回手續費
                 net_pnl = cost.net_pnl_pct(position["entry_price"], exit_price)
                 trades.append({
                     "stock_id":    stock_id,
@@ -270,10 +309,12 @@ def backtest(strategy_name: str, stock_id: str, start_date: str,
                     "cost_basis":  position["cost_basis"],
                     "exit_date":   df.iloc[i]["date"],
                     "exit_price":  exit_price,
-                    "pnl_pct":     round(net_pnl, 2),   # 淨損益率（已扣來回費）
+                    "pnl_pct":     round(net_pnl, 2),
                     "hold_days":   hold_days,
                     "exit_reason": exit_reason,
                     "signal":      position["signal"],
+                    "macro_score": position.get("macro_score"),
+                    "macro_flag":  position.get("macro_flag"),
                 })
                 position = None
 
@@ -377,12 +418,15 @@ def print_backtest_report(result: dict):
 
     if trades:
         print("\n近10筆交易（pnl_pct 已扣來回手續費）：")
-        print(f"  {'進場日':<12} {'進場價':>8} {'成本價':>8} {'出場日':<12} {'出場價':>8} {'淨利%':>7} {'持有天':>6} {'原因'}")
-        print("  " + "-" * 75)
+        print(f"  {'進場日':<12} {'進場價':>8} {'成本價':>8} {'出場日':<12} {'出場價':>8} {'淨利%':>7} {'持有天':>6} {'宏觀':>6} {'原因'}")
+        print("  " + "-" * 85)
         for t in trades[-10:]:
             cb = t.get("cost_basis", t["entry_price"])
+            macro = f"{t.get('macro_flag','?')}"
+            if t.get('macro_score') is not None:
+                macro = f"{t.get('macro_flag','?')}:{t.get('macro_score',0):.0f}"
             print(f"  {t['entry_date']:<12} {t['entry_price']:>8.2f} {cb:>8.2f} {t['exit_date']:<12} "
-                  f"{t['exit_price']:>8.2f} {t['pnl_pct']:>+7.2f}% {t['hold_days']:>6} {t['exit_reason']}")
+                  f"{t['exit_price']:>8.2f} {t['pnl_pct']:>+7.2f}% {t['hold_days']:>6} {macro:>8} {t['exit_reason']}")
 
 
 # ── 主程式 ───────────────────────────────────────────────
