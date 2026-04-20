@@ -74,7 +74,7 @@ def list_to_df(token: str, stock_ids: list[str]) -> list[dict]:
     Returns list of dict records.
     """
     return dl.taiwan_stock_info(
-        token=token,
+        
     ).to_dict(orient="records")
 
 
@@ -177,7 +177,7 @@ def fetch_daily_price_batch(token: str, stock_ids: list[str],
     Returns [(stock_id, records), ...]  (stock_id repeated per record)
     """
     df = dl.taiwan_stock_daily(
-        token=token,
+        
         stock_id=stock_ids,        # SDK accepts list
         start_date=start,
         end_date=end,
@@ -191,7 +191,7 @@ def fetch_institutional_batch(token: str, stock_ids: list[str],
                                start: str, end: str) -> list[dict]:
     """Fetch institutional data for a list of stock_ids."""
     df = dl.taiwan_stock_institutional(
-        token=token,
+        
         stock_id=stock_ids,
         start_date=start,
         end_date=end,
@@ -214,9 +214,9 @@ def ingest_daily_price(stock_ids: list[str], since: str | None,
 
     end = date.today().isoformat()
 
-    # build start date: max date already in DB, else since
+    # build start date: max date already in DB, else since (explicit since overrides DB detection)
     db_max = get_db_max_date(conn, "daily_price")
-    start = db_max if db_max else (since or SINCE_DEFAULT)
+    start = (since or SINCE_DEFAULT) if since else (db_max or SINCE_DEFAULT)
     print(f"[daily_price] start={start}  end={end}  stocks={len(stock_ids)}")
 
     n = len(stock_ids)
@@ -225,7 +225,7 @@ def ingest_daily_price(stock_ids: list[str], since: str | None,
 
         try:
             df = dl.taiwan_stock_daily(
-                token=token,
+                
                 stock_id=batch,
                 start_date=start,
                 end_date=end,
@@ -261,7 +261,7 @@ def ingest_institutional_data(stock_ids: list[str], since: str | None,
 
     # incremental: find latest date per stock in DB
     db_max = get_db_max_date(conn, "institutional")
-    start = db_max if db_max else (since or SINCE_DEFAULT)
+    start = (since or SINCE_DEFAULT) if since else (db_max or SINCE_DEFAULT)
     print(f"[institutional] start={start}  end={end}  stocks={len(stock_ids)}")
 
     n = len(stock_ids)
@@ -270,7 +270,7 @@ def ingest_institutional_data(stock_ids: list[str], since: str | None,
 
         try:
             df = dl.taiwan_stock_institutional(
-                token=token,
+                
                 stock_id=batch,
                 start_date=start,
                 end_date=end,
@@ -296,22 +296,32 @@ def ingest_institutional_data(stock_ids: list[str], since: str | None,
 def resolve_stock_ids(limit: int | None, token: str) -> list[str]:
     """
     回傳要攝取的股票代號列表。
-    優先從 DB 的 daily_price 拿；DB 空的話從 FinMind 抓全市場列表再 limit。
+    優先從 DB 的 daily_price 拿；DB 不足 limit 時，從 FinMind 補足。
     """
     conn = sqlite3.connect(DB_PATH)
     db_ids = get_stock_ids_from_db(conn)
     conn.close()
 
-    if db_ids:
-        print(f"Using {len(db_ids)} stock IDs from DB (all in daily_price)")
-        return db_ids[:limit] if limit else db_ids
+    if not db_ids:
+        # DB 完全空的話，從 FinMind 抓全市場列表
+        print("DB empty, fetching stock list from FinMind …")
+        all_ids = fetch_stock_list(token)
+        chosen = all_ids[:limit] if limit else all_ids
+        print(f"Fetched {len(chosen)} stock IDs from FinMind")
+        return chosen
 
-    # DB empty → fetch from FinMind
-    print("DB empty, fetching stock list from FinMind …")
-    all_ids = fetch_stock_list(token)
-    chosen = all_ids[:limit] if limit else all_ids
-    print(f"Fetched {len(chosen)} stock IDs from FinMind")
-    return chosen
+    # DB 有股票，但數量不足 limit → 從 FinMind 補足
+    if limit and len(db_ids) < limit:
+        print(f"DB has {len(db_ids)} stocks, supplementing from FinMind to reach {limit} …")
+        all_ids = fetch_stock_list(token)
+        existing = set(db_ids)
+        supplemented = [sid for sid in all_ids if sid not in existing]
+        chosen = db_ids + supplemented[:limit - len(db_ids)]
+        print(f"Using {len(db_ids)} DB + {len(chosen) - len(db_ids)} new = {len(chosen)} total")
+        return chosen
+
+    print(f"Using {len(db_ids)} stock IDs from DB")
+    return db_ids[:limit] if limit else db_ids
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
