@@ -27,3 +27,4 @@ logs/*.log
 .DS_Store
 Thumbs.db
 .trade_core.env
+output/*.png
