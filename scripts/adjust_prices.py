@@ -37,8 +37,8 @@ def get_token() -> str:
     return ""
 
 
-def fetch_dividends(stock_id: str, token: str) -> list:
-    """取得除權除息資料"""
+def fetch_dividends(stock_id: str, token: str, retries: int = 3) -> list:
+    """取得除權除息資料（含 retry）"""
     url = f"{FINMIND_API}/data"
     params = {
         "dataset": "TaiwanStockDividend",
@@ -50,12 +50,23 @@ def fetch_dividends(stock_id: str, token: str) -> list:
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
-    resp = requests.get(url, params=params, headers=headers, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("status") != 200:
-        return []
-    return data.get("data", [])
+    for attempt in range(retries):
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("status") == 200:
+                return data.get("data", [])
+            return []
+        except (requests.exceptions.HTTPError, requests.exceptions.ConnectionError) as e:
+            if attempt < retries - 1:
+                import time
+                time.sleep(2 ** attempt)  # Exponential backoff
+                continue
+            import logging
+            logging.warning(f"fetch_dividends failed after {retries} attempts: {e}")
+            return []
+    return []
 
 
 def build_adjustment_factors(dividend_records: list, price_records: list) -> dict:

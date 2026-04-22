@@ -202,12 +202,21 @@ def backtest(strategy_name: str, stock_id: str, start_date: str,
 
     i = 1  # 從第2根開始（有前一筆可以比較交叉）
     while i < len(df):
-        ind = indicators_at(df, i)
+        # Cache indicators to avoid recomputation (Pattern: Select - memoize promise)
+        if i == start_idx + 1:
+            # First iteration: compute both current and previous
+            prev_ind = indicators_at(df, i - 1)
+            ind = indicators_at(df, i)
+        else:
+            # Subsequent: reuse previous ind as prev_ind, compute only current
+            prev_ind = _cached_ind
+            ind = indicators_at(df, i)
+        _cached_ind = ind
+        
         if ind is None:
             i += 1
             continue
 
-        prev_ind = indicators_at(df, i - 1)
         if prev_ind is None:
             i += 1
             continue
@@ -235,12 +244,16 @@ def backtest(strategy_name: str, stock_id: str, start_date: str,
                 macro_filter_passed = True
                 if JIN10_AVAILABLE:
                     try:
-                        macro_score = jc.get_macro_sentiment()
-                        macro_flag = jc.check_macro_threshold(
-                            macro_score,
-                            bull_threshold=MACRO_BULL_THRESHOLD,
-                            bear_threshold=MACRO_BEAR_THRESHOLD,
-                        )
+                        # Cache macro sentiment for backtest run (avoid per-bar API calls)
+                        if _macro_cached["score"] is None:
+                            _macro_cached["score"] = jc.get_macro_sentiment()
+                            _macro_cached["flag"] = jc.check_macro_threshold(
+                                _macro_cached["score"],
+                                bull_threshold=MACRO_BULL_THRESHOLD,
+                                bear_threshold=MACRO_BEAR_THRESHOLD,
+                            )
+                        macro_score = _macro_cached["score"]
+                        macro_flag = _macro_cached["flag"]
                         # LONG 訊號需要宏觀 BULL，SHORT 訊號需要 BEAR
                         # 多頭策略（kd_cross, macd_bull, ma_bull）預設是 LONG
                         # 若宏觀不支持則跳過這筆進場
