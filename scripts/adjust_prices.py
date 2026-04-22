@@ -75,7 +75,7 @@ def build_adjustment_factors(dividend_records: list, price_records: list) -> dic
       每經過一次除權息日，因子就往上跳一階。
     """
     if not dividend_records or not price_records:
-        return {}
+        return {}, {}
 
     # 建立 {date: cash_per_share} 的對照
     # 注意：台灣股利 = CashEarningsDistribution（盈餘配股/配息）
@@ -187,8 +187,9 @@ def save_adjusted_prices(stock_id: str, adjusted_records: list):
                 r["close"], r["adj_close"], r["adj_factor"], r["volume"],
             ))
             inserted += 1
-        except Exception:
-            pass
+        except Exception as e:
+            import logging
+            logging.warning(f"Failed to insert adjusted price for {r.get('stock_id', '?')}: {e}")
 
     conn.commit()
     conn.close()

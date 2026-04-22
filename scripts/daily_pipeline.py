@@ -129,8 +129,9 @@ def ingest_single_price(stock_id: str, start_date: str, end_date: str, token: st
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (r["stock_id"], r["date"], r["open"], r["max"], r["min"], r["close"], r["Trading_Volume"]))
             inserted += 1
-        except Exception:
-            pass
+        except Exception as e:
+            import logging
+            logging.warning(f"Failed to insert stock {stock_id}: {e}")
     conn.commit()
     conn.close()
     time.sleep(0.3)  # rate limit 保護
@@ -160,8 +161,9 @@ def adjust_all_prices() -> int:
             result = process_stock(sid, token)
             if result.get("status") == "ok":
                 adjusted += 1
-        except Exception:
-            pass
+        except Exception as e:
+            import logging
+            logging.warning(f"Failed to adjust {sid}: {e}")
     return adjusted
 
 

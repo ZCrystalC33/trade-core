@@ -247,8 +247,10 @@ def backtest(strategy_name: str, stock_id: str, start_date: str,
                         if strategy_name in ("kd_cross", "macd_bull", "ma_bull", "all"):
                             if macro_flag != "BULL":
                                 macro_filter_passed = False
-                    except Exception:
+                    except Exception as e:
                         # 宏觀API失效時，放行所有進場（不鎖死系統）
+                        import logging
+                        logging.warning(f"Macro API failed: {e}")
                         macro_score = None
                         macro_flag = "UNKNOWN"
                 else:
@@ -413,7 +415,7 @@ def print_backtest_report(result: dict):
     print(f"  平均虧損    ：{s['avg_loss']}%")
     print(f"  最大區間虧損：{s['max_drawdown']}%")
     print(f"  總報酬率    ：{s['total_return']}%")
-    print(f"  平均持有天數：{s['avg_hold_days']} 天")
+    print(f"  平均持有天數：{s.get('avg_hold_days', 0)} 天")
     print(f"{'='*60}")
 
     if trades:
