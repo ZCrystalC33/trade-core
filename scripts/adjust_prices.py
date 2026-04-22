@@ -108,7 +108,7 @@ def build_adjustment_factors(dividend_records: list, price_records: list) -> dic
 
         # 如果今日是除權息日，則從累積中扣除（因為股價已反應）
         if date in ex_dates:
-            cumulative_div = cumulative_div + ex_dates[date]
+            cumulative_div = cumulative_div - ex_dates[date]
 
         factors[date] = cumulative_div
         prev_date = date

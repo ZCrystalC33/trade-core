@@ -32,9 +32,11 @@ def scan_kd_gold_cross(min_k=20, max_k=60) -> list:
     conn.close()
 
     candidates = []
+    import logging
     for sid in stocks:
         r = generate_signals(sid)
         if "error" in r:
+            logging.debug(f"Skipping {sid}: {r['error']}")
             continue
         ind = r["indicators"]
         k = ind.get("K")
@@ -63,9 +65,11 @@ def scan_macd_bull() -> list:
     conn.close()
 
     candidates = []
+    import logging
     for sid in stocks:
         r = generate_signals(sid)
         if "error" in r:
+            logging.debug(f"Skipping {sid}: {r['error']}")
             continue
         ind = r["indicators"]
         dif = ind.get("DIF")
@@ -96,9 +100,11 @@ def scan_volume_surge(threshold: float = 1.8) -> list:
     conn.close()
 
     candidates = []
+    import logging
     for sid in stocks:
         r = generate_signals(sid)
         if "error" in r:
+            logging.debug(f"Skipping {sid}: {r['error']}")
             continue
         ind = r["indicators"]
         vol = r["volume"]
@@ -131,9 +137,11 @@ def scan_ma_bull排列() -> list:
     conn.close()
 
     candidates = []
+    import logging
     for sid in stocks:
         r = generate_signals(sid)
         if "error" in r:
+            logging.debug(f"Skipping {sid}: {r['error']}")
             continue
         ind = r["indicators"]
         ma5 = ind.get("MA5")

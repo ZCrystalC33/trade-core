@@ -283,7 +283,8 @@ def backtest(strategy_name: str, stock_id: str, start_date: str,
             hold_days = i - position["entry_idx"]
             current_price = df.iloc[i]["close"]
 
-            # 以進場價計算毛損益率（未含手續費）
+            # 以進場價計算毛損益率（含進場滑價，不含出場合約）
+            # entry_price 已含進場滑價，current_price 為原始收盤價
             gross_pnl_pct = (current_price - position["entry_price"]) / position["entry_price"]
 
             # 停損判斷：
