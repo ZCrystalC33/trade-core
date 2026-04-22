@@ -112,6 +112,7 @@ def init_database():
         signal_date      TEXT    NOT NULL,   -- 訊號產生日期
         signal_type      TEXT    NOT NULL,   -- 訊號類型（KD_GOLD_CROSS / MACD_BULL 等）
         signal_source    TEXT    NOT NULL,   -- 訊號來源（SCANNER / MANUAL）
+        market           TEXT    DEFAULT 'TW', -- 市場（TW / US / CRYPTO）
         price_at_signal  REAL    NOT NULL,   -- 訊號產生時的價格
         indicators_json  TEXT    DEFAULT NULL, -- 當下技術指標數值（JSON格式儲存）
         expected_direction TEXT  NOT NULL,   -- 預期方向（LONG / SHORT）

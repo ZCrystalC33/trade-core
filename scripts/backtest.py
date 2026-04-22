@@ -200,6 +200,7 @@ def backtest(strategy_name: str, stock_id: str, start_date: str,
     trades = []
     position = None  # {'entry_date','entry_idx','entry_price','cost_basis','shares'}
     _first_iteration = True  # 首次迭代標記
+    _macro_cached = {"score": None, "flag": None}  # Macro sentiment cache
 
     i = 1  # 從第2根開始（有前一筆可以比較交叉）
     while i < len(df):
