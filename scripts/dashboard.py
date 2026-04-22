@@ -64,8 +64,8 @@ def load_stats() -> dict:
         c.execute("""
             SELECT
                 COUNT(*) as total,
-                SUM(CASE WHEN pnl_pct > 0 THEN 1 ELSE 0 END) as wins,
-                AVG(pnl_pct) as avg_pnl
+                SUM(CASE WHEN realized_pnl_pct > 0 THEN 1 ELSE 0 END) as wins,
+                AVG(realized_pnl_pct) as avg_pnl
             FROM trades WHERE status='CLOSED'
         """)
         r = c.fetchone()

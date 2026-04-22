@@ -199,14 +199,16 @@ def backtest(strategy_name: str, stock_id: str, start_date: str,
 
     trades = []
     position = None  # {'entry_date','entry_idx','entry_price','cost_basis','shares'}
+    _first_iteration = True  # 首次迭代標記
 
     i = 1  # 從第2根開始（有前一筆可以比較交叉）
     while i < len(df):
         # Cache indicators to avoid recomputation (Pattern: Select - memoize promise)
-        if i == start_idx + 1:
+        if _first_iteration:
             # First iteration: compute both current and previous
             prev_ind = indicators_at(df, i - 1)
             ind = indicators_at(df, i)
+            _first_iteration = False
         else:
             # Subsequent: reuse previous ind as prev_ind, compute only current
             prev_ind = _cached_ind
