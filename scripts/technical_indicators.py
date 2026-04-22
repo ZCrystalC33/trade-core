@@ -34,6 +34,39 @@ def get_price_data(stock_id: str, days: int = 120) -> list:
     return result
 
 
+def get_price_data_batch(stock_ids: list, days: int = 120) -> dict:
+    """批量取得多檔股票的日K資料（單一查詢）
+    
+    Returns: {stock_id: [list of price dicts]}
+    """
+    if not stock_ids:
+        return {}
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    # Single query with IN clause
+    placeholders = ",".join("?" * len(stock_ids))
+    cursor.execute(f"""
+        SELECT stock_id, date, open, high, low, close, volume
+        FROM daily_price
+        WHERE stock_id IN ({placeholders})
+        ORDER BY stock_id, date DESC
+    """, tuple(stock_ids))
+    rows = cursor.fetchall()
+    conn.close()
+    # Group by stock_id
+    result = {}
+    for row in rows:
+        sid = row["stock_id"]
+        if sid not in result:
+            result[sid] = []
+        result[sid].append(dict(row))
+    # Reverse each stock's data (oldest first)
+    for sid in result:
+        result[sid].reverse()
+    return result
+
+
 def calc_ma(closes: list, period: int) -> list:
     """移動平均線（MA）"""
     result = [None] * (period - 1)

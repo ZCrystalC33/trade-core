@@ -8,7 +8,8 @@
 import sqlite3
 import json
 from pathlib import Path
-from technical_indicators import generate_signals, get_price_data
+from technical_indicators import generate_signals, get_price_data, get_price_data_batch, calc_kd, calc_macd, calc_ma
+import logging
 
 try:
     import jin10_client as jc
@@ -232,6 +233,202 @@ def run_all_scans() -> dict:
         print(f"\n{'='*50}")
         print("✅ 掃描完成")
     return results
+
+
+
+
+# ── Batch Scan Functions (N+1 Query Fix) ─────────────────────────────────
+
+def scan_kd_batch(stock_ids: list, min_k: float = 20, max_k: float = 80) -> list:
+    """批量 KD 黃金交叉掃描（單一 DB 查詢）"""
+    if not stock_ids:
+        return []
+    
+    all_data = get_price_data_batch(stock_ids, days=120)
+    
+    candidates = []
+    for sid, data in all_data.items():
+        if len(data) < 60:
+            logging.debug(f"Skipping {sid}: insufficient data")
+            continue
+        
+        try:
+            closes = [d["close"] for d in data]
+            highs = [d["high"] for d in data]
+            lows = [d["low"] for d in data]
+            
+            k, d = calc_kd(highs, lows, closes)
+            if k and d and k[-1] > d[-1] and max_k > k[-1] > min_k:
+                candidates.append({
+                    "stock_id": sid,
+                    "close": closes[-1],
+                    "K": k[-1],
+                    "D": d[-1],
+                })
+        except Exception as e:
+            logging.debug(f"Error processing {sid}: {e}")
+    
+    candidates.sort(key=lambda x: x["K"], reverse=True)
+    return candidates
+
+
+def scan_macd_batch(stock_ids: list) -> list:
+    """批量 MACD 多頭掃描（單一 DB 查詢）"""
+    if not stock_ids:
+        return []
+    
+    all_data = get_price_data_batch(stock_ids, days=120)
+    
+    candidates = []
+    for sid, data in all_data.items():
+        if len(data) < 60:
+            continue
+        
+        try:
+            closes = [d["close"] for d in data]
+            dif, dea, macd_bar = calc_macd(closes)
+            
+            if dif and dea and dif[-1] > dea[-1] and macd_bar[-1] > 0:
+                candidates.append({
+                    "stock_id": sid,
+                    "close": closes[-1],
+                    "DIF": dif[-1],
+                    "DEA": dea[-1],
+                    "MACD_Bar": macd_bar[-1],
+                })
+        except Exception as e:
+            logging.debug(f"Error processing {sid}: {e}")
+    
+    candidates.sort(key=lambda x: x["DIF"], reverse=True)
+    return candidates
+
+
+def scan_volume_surge_batch(stock_ids: list, threshold: float = 1.8) -> list:
+    """批量量能暴增掃描（單一 DB 查詢）"""
+    if not stock_ids:
+        return []
+    
+    all_data = get_price_data_batch(stock_ids, days=120)
+    
+    candidates = []
+    for sid, data in all_data.items():
+        if len(data) < 25:
+            continue
+        
+        try:
+            closes = [d["close"] for d in data]
+            volumes = [d["volume"] for d in data]
+            
+            vol5_ma = calc_ma(volumes, 5)
+            vol20_ma = calc_ma(volumes, 20)
+            
+            vol5 = vol5_ma[-1] if vol5_ma else None
+            vol20 = vol20_ma[-1] if vol20_ma else None
+            vol = volumes[-1]
+            
+            if vol5 and vol20 and vol > vol5 * threshold:
+                candidates.append({
+                    "stock_id": sid,
+                    "close": closes[-1],
+                    "vol_ratio": vol / vol5,
+                })
+        except Exception as e:
+            logging.debug(f"Error processing {sid}: {e}")
+    
+    candidates.sort(key=lambda x: x["vol_ratio"], reverse=True)
+    return candidates
+
+
+def scan_ma_bull_batch(stock_ids: list) -> list:
+    """批量均線多頭排列掃描（單一 DB 查詢）"""
+    if not stock_ids:
+        return []
+    
+    all_data = get_price_data_batch(stock_ids, days=120)
+    
+    candidates = []
+    for sid, data in all_data.items():
+        if len(data) < 65:
+            continue
+        
+        try:
+            closes = [d["close"] for d in data]
+            
+            ma5 = calc_ma(closes, 5)
+            ma20 = calc_ma(closes, 20)
+            ma60 = calc_ma(closes, 60)
+            
+            ma5_v = ma5[-1] if ma5 else None
+            ma20_v = ma20[-1] if ma20 else None
+            ma60_v = ma60[-1] if ma60 else None
+            
+            if all(x is not None for x in [ma5_v, ma20_v, ma60_v]):
+                if ma5_v > ma20_v > ma60_v:
+                    candidates.append({
+                        "stock_id": sid,
+                        "close": closes[-1],
+                        "MA5": ma5_v,
+                        "MA20": ma20_v,
+                        "MA60": ma60_v,
+                    })
+        except Exception as e:
+            logging.debug(f"Error processing {sid}: {e}")
+    
+    candidates.sort(key=lambda x: x["close"], reverse=True)
+    return candidates
+
+
+def run_all_scans_batch() -> dict:
+    """一口氣跑所有批量掃描（優化版）"""
+    print("🔍 Stephanie 股票掃描器 (Batch Mode)")
+    print("=" * 50)
+    
+    # Fetch all stocks once
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT DISTINCT stock_id FROM daily_price ORDER BY stock_id")
+    stock_ids = [r[0] for r in cursor.fetchall()]
+    conn.close()
+    
+    print(f"📊 共 {len(stock_ids)} 檔股票")
+    
+    results = {}
+    
+    print("\n📌 掃描 1：KD 黃金交叉")
+    print("-" * 40)
+    kd = scan_kd_batch(stock_ids, min_k=20, max_k=80)
+    results["kd_cross"] = kd[:10]
+    for i, c in enumerate(kd[:10], 1):
+        print(f"  {i}. {c['stock_id']} K={c['K']:.1f} D={c['D']:.1f}")
+    
+    print("\n📌 掃描 2：MACD 多頭")
+    print("-" * 40)
+    macd = scan_macd_batch(stock_ids)
+    results["macd_bull"] = macd[:10]
+    for i, c in enumerate(macd[:10], 1):
+        print(f"  {i}. {c['stock_id']} DIF={c['DIF']:.2f} DEA={c['DEA']:.2f}")
+    
+    print("\n📌 掃描 3：量能暴增")
+    print("-" * 40)
+    vol = scan_volume_surge_batch(stock_ids, 1.8)
+    results["volume_surge"] = vol[:10]
+    for i, c in enumerate(vol[:10], 1):
+        print(f"  {i}. {c['stock_id']} 量比={c['vol_ratio']:.1f}x")
+    
+    print("\n📌 掃描 4：均線多頭排列")
+    print("-" * 40)
+    ma = scan_ma_bull_batch(stock_ids)
+    results["ma_bull"] = ma[:10]
+    for i, c in enumerate(ma[:10], 1):
+        print(f"  {i}. {c['stock_id']} MA5={c['MA5']:.1f} MA20={c['MA20']:.1f} MA60={c['MA60']:.1f}")
+    
+    print(f"\n{'='*50}")
+    print("✅ 掃描完成")
+    return results
+
+
+if __name__ == "__main__":
+    run_all_scans_batch()
 
 
 if __name__ == "__main__":

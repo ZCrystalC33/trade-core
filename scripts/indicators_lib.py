@@ -51,6 +51,10 @@ def add_ma(df: pd.DataFrame, periods=(5, 10, 20, 60)) -> pd.DataFrame:
         col = f"MA{p}"
         if col in df.columns:
             continue
+        if len(df) < p:
+            # 資料不足，跳過（避免長度 mismatch）
+            df[col] = np.nan
+            continue
         vals = [np.nan] * (p - 1)
         for i in range(p - 1, len(df)):
             vals.append(round(df["close"].iloc[i - p + 1 : i + 1].mean(), 2))
@@ -105,7 +109,8 @@ def add_kd(df: pd.DataFrame, n: int = 9) -> pd.DataFrame:
     d_list = list(d)
 
     # 第一個有效 RSV
-    first_rsv = rsv_s.dropna().iloc[0]
+    # Standard KD initialization: start at 50
+    first_rsv = 50.0
     k_list.append(first_rsv)
     d_list.append(first_rsv)
 
@@ -258,7 +263,11 @@ def lag_indicators(df: pd.DataFrame, n: int = 1) -> pd.DataFrame:
 
 # ── 純量取最新 non-NaN 值 ────────────────────────────────
 
-def get_valid(series: pd.Series):
-    """從 series 末尾取第一個非 NaN 值，無則回傳 None"""
-    vals = series.dropna()
-    return float(vals.iloc[-1]) if len(vals) else None
+def get_valid(val):
+    """從 series 末尾或純量取第一個非 NaN 值，無則回傳 None"""
+    if isinstance(val, pd.Series):
+        vals = val.dropna()
+        return float(vals.iloc[-1]) if len(vals) else None
+    elif isinstance(val, (int, float)):
+        return None if (val is None or np.isnan(val)) else float(val)
+    return None
