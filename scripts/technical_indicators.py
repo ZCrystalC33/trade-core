@@ -148,7 +148,7 @@ def calc_macd(closes: list, fast: int = 12, slow: int = 26, signal: int = 9) -> 
 
 
 def calc_rsi(closes: list, period: int = 14) -> list:
-    """RSI 指標（SMA版）"""
+    """RSI 指標（Wilder 平滑版，標準 RSI 算法）"""
     result = [None] * period
     if len(closes) < period + 1:
         return result
@@ -189,7 +189,7 @@ def calc_bollinger(closes: list, period: int = 20, std_mult: float = 2) -> tuple
             lower.append(None)
         else:
             window = closes[i - period + 1 : i + 1]
-            std = (sum((x - ma[i]) ** 2 for x in window) / period) ** 0.5
+            std = (sum((x - ma[i]) ** 2 for x in window) / (period - 1)) ** 0.5  # Sample std dev (ddof=1)
             upper.append(round(ma[i] + std_mult * std, 2))
             lower.append(round(ma[i] - std_mult * std, 2))
     return upper, ma, lower

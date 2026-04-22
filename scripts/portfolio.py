@@ -112,7 +112,7 @@ def check_risk() -> list:
         return ["（目前無持倉）"]
 
     # 假設總資金 100萬（需改為動態讀取真實帳務）
-    TOTAL_CAPITAL = float(os.environ.get("PORTFOLIO_CAPITAL", "1000000"))
+    TOTAL_CAPITAL = float(os.environ.get("PORTFOLIO_CAPITAL") or "1000000")
     SINGLE_MAX_PCT = 0.05       # 單筆不超過5%
     DAILY_LOSS_STOP = 0.03      # 單日虧損>3%停止
     TOTAL_POS_MAX   = 0.70      # 總持倉不超過70%
