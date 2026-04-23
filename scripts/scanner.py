@@ -3,13 +3,21 @@
  Stephanie 量化系統
  股票掃描器（Scanner）
  用途：根據技術指標條件，自動篩選候選股票
+
+ 三層防護（解決全資料庫掃描效能問題）：
+  1. 白名單制度 — 只掃 watchlist 內的股票
+  2. 指標快取 — indicator_cache 表，直接讀取不重算
+  3. Jin10 宏觀情緒 — 前置檢查，幫 Scanner 過濾
 """
 
 import sqlite3
 import json
-from pathlib import Path
-from technical_indicators import generate_signals, get_price_data, get_price_data_batch, calc_kd, calc_macd, calc_ma
 import logging
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import pandas as pd
+import indicators_lib as il
 
 try:
     import jin10_client as jc
@@ -19,417 +27,444 @@ except ImportError:
     jc = None
 
 DB_PATH = Path(__file__).parent.parent / "data" / "stock_quant.db"
+CACHE_VALID_DAYS = 1  # 指標快取有效天數
 
 
-def scan_kd_gold_cross(min_k=20, max_k=60) -> list:
+# ── 工具─────────────────────────────────────────────────────────
+
+def get_watchlist_stocks(market: str = "TW") -> list:
     """
-    篩選 KD 黃金交叉且 K值在合理區間的股票
-    （避免已經飆過70以上的黃金交叉）
+    讀取白名單（watchlist）中的股票代碼清單。
+    如果 watchlist 為空，自動 fallback 回原本的追蹤標的。
     """
     conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT DISTINCT stock_id FROM daily_price ORDER BY stock_id")
-    stocks = [r[0] for r in cursor.fetchall()]
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT stock_id, name FROM watchlist
+        WHERE active = 1 AND market = ?
+        ORDER BY added_at ASC
+    """, (market,))
+    rows = cur.fetchall()
     conn.close()
 
+    if not rows:
+        # Fallback：讀 stock_info 表當作追蹤標的
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT stock_id, name FROM stock_info WHERE market = ? LIMIT 20", (market,))
+        rows = cur.fetchall()
+        conn.close()
+
+    return [(r[0], r[1]) for r in rows]
+
+
+def get_stocks_with_new_data(days: int = 30) -> list:
+    """只回傳近N天有新增日K資料的股票（來自 watchlist）"""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT DISTINCT w.stock_id, w.name
+        FROM watchlist w
+        JOIN daily_price dp ON dp.stock_id = w.stock_id
+        WHERE dp.date >= date('now', ?)
+          AND w.active = 1
+        ORDER BY w.stock_id
+    """, (f"-{days} days",))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def _get_price_data(stock_id: str, days: int = 120) -> pd.DataFrame:
+    """從資料庫讀取日K（pandas DataFrame，由舊到新）"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT date, open, high, low, close, volume
+        FROM daily_price
+        WHERE stock_id = ?
+        ORDER BY date ASC
+        LIMIT ?
+    """, (stock_id, days))
+    rows = cur.fetchall()
+    conn.close()
+    return pd.DataFrame([dict(r) for r in rows])
+
+
+def _compute_indicators(stock_id: str) -> dict | None:
+    """計算指標並寫入快取表，回傳 indicators dict"""
+    df = _get_price_data(stock_id, 120)
+    if len(df) < 60:
+        return None
+
+    df = il.add_all_indicators(df)
+    ind = il.latest_indicators(df)
+
+    # 寫入快取 — numpy type 全部轉成 Python 原生型別再 JSON serialize
+    def _to_native(obj):
+        import numpy as np
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        raise TypeError(f"unserializable: {type(obj)}")
+    indicators_json = json.dumps(ind, default=_to_native)
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR REPLACE INTO indicator_cache
+        (stock_id, cached_at, close_at_cache, indicators_json, score, score_label)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        stock_id,
+        datetime.now().strftime("%Y-%m-%d"),
+        ind.get("close"),
+        indicators_json,
+        None, None  # score/score_label 由呼叫者填
+    ))
+    conn.commit()
+    conn.close()
+
+    ind["stock_id"] = stock_id
+    ind["date"] = df["date"].iloc[-1]
+    return ind
+
+
+def get_cached_indicators(stock_id: str) -> dict | None:
+    """
+    從快取讀取指標，若快取已過期或不存在則回傳 None。
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT cached_at, indicators_json, close_at_cache
+        FROM indicator_cache
+        WHERE stock_id = ?
+    """, (stock_id,))
+    row = cur.fetchone()
+    conn.close()
+
+    if not row:
+        return None
+
+    cached_at_str, indicators_json, close_at_cache = row
+    cached_at = datetime.strptime(cached_at_str, "%Y-%m-%d")
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    # 當日快取仍有效
+    if cached_at_str == today:
+        ind = json.loads(indicators_json)
+        ind["stock_id"] = stock_id
+        ind["date"] = cached_at_str
+        ind["close"] = close_at_cache
+        return ind
+
+    # 快取已過期
+    return None
+
+
+def get_indicators(stock_id: str) -> dict | None:
+    """
+    拿到乾淨指標（快取優先，沒有就算）。
+    """
+    ind = get_cached_indicators(stock_id)
+    if ind is not None:
+        return ind
+    return _compute_indicators(stock_id)
+
+
+# ── 訊號判定─────────────────────────────────────────────────────
+
+def detect_signals(ind: dict) -> dict:
+    """根據指標 dict 判斷訊號，回傳 {signal_type: description}"""
+    signals = {}
+    k, d = ind.get("K"), ind.get("D")
+    dif, dea = ind.get("DIF"), ind.get("DEA")
+    macd_bar = ind.get("MACD_Bar")
+    ma5 = ind.get("MA5")
+    ma20 = ind.get("MA20")
+    ma60 = ind.get("MA60")
+    close = ind.get("close")
+    vol = ind.get("volume")
+    vol5_ma = ind.get("Vol_MA5")
+
+    if k is not None and d is not None:
+        if k > d and k < 30:
+            signals["KD_GOLD_CROSS_LOW"] = "KD低檔黃金交叉"
+        elif k > d:
+            signals["KD_GOLD_CROSS"] = "KD黃金交叉"
+        elif k < d and k > 70:
+            signals["KD_DEATH_CROSS_HIGH"] = "KD高檔死亡交叉"
+        elif k < d:
+            signals["KD_DEATH_CROSS"] = "KD死亡交叉"
+
+    if dif is not None and dea is not None:
+        if dif > dea:
+            signals["MACD_BULL"] = "MACD多頭"
+        else:
+            signals["MACD_BEAR"] = "MACD空頭"
+
+    if macd_bar is not None:
+        if macd_bar > 0:
+            signals["MACD_BAR_POS"] = "MACD柱狀圖正值"
+        else:
+            signals["MACD_BAR_NEG"] = "MACD柱狀圖負值"
+
+    if ma5 and ma20 and ma60:
+        if ma5 > ma20 > ma60:
+            signals["MA_BULL"] = "均線多頭排列"
+        elif ma5 < ma20 < ma60:
+            signals["MA_BEAR"] = "均線空頭排列"
+
+    if vol5_ma and vol and close and ma5:
+        if vol > vol5_ma * 1.8 and close > ma5:
+            signals["VOL_SPIKE"] = "量能暴增（>1.8倍均量）"
+
+    return signals
+
+
+# ── Scanner（白名單 + 快取導向）─────────────────────────────────
+
+def scan_kd_gold_cross(market: str = "TW", min_k: float = 20, max_k: float = 80) -> list:
+    """KD 低檔黃金交叉（只看 watchlist）"""
+    watchlist = get_watchlist_stocks(market)
     candidates = []
-    import logging
-    for sid in stocks:
-        r = generate_signals(sid)
-        if "error" in r:
-            logging.debug(f"Skipping {sid}: {r['error']}")
+
+    for sid, _ in watchlist:
+        ind = get_indicators(sid)
+        if ind is None:
             continue
-        ind = r["indicators"]
-        k = ind.get("K")
-        d = ind.get("D")
-        if k and d and k > d and k < max_k and k > min_k:
+        k, d = ind.get("K"), ind.get("D")
+        if k is not None and d is not None and k > d and min_k < k < max_k:
             candidates.append({
                 "stock_id": sid,
-                "close": r["close"],
-                "K": k,
-                "D": d,
-                "score": r["score"],
-                "label": r["score_label"],
-                "date": r["analyzed_date"],
+                "close": ind.get("close"),
+                "K": round(k, 2),
+                "D": round(d, 2),
+                "date": ind.get("date"),
             })
 
-    candidates.sort(key=lambda x: x["score"], reverse=True)
+    candidates.sort(key=lambda x: x["K"], reverse=True)
     return candidates
 
 
-def scan_macd_bull() -> list:
-    """篩選 MACD 多頭（DIF>DEA 且 MACD_Bar 轉正）"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT DISTINCT stock_id FROM daily_price ORDER BY stock_id")
-    stocks = [r[0] for r in cursor.fetchall()]
-    conn.close()
-
+def scan_macd_bull(market: str = "TW") -> list:
+    """MACD 多頭（只看 watchlist）"""
+    watchlist = get_watchlist_stocks(market)
     candidates = []
-    import logging
-    for sid in stocks:
-        r = generate_signals(sid)
-        if "error" in r:
-            logging.debug(f"Skipping {sid}: {r['error']}")
+
+    for sid, _ in watchlist:
+        ind = get_indicators(sid)
+        if ind is None:
             continue
-        ind = r["indicators"]
-        dif = ind.get("DIF")
-        dea = ind.get("DEA")
+        dif, dea = ind.get("DIF"), ind.get("DEA")
         macd_bar = ind.get("MACD_Bar")
-        if dif and dea and dif > dea and macd_bar and macd_bar > 0:
-            candidates.append({
-                "stock_id": sid,
-                "close": r["close"],
-                "DIF": dif,
-                "DEA": dea,
-                "MACD_Bar": macd_bar,
-                "score": r["score"],
-                "label": r["score_label"],
-                "date": r["analyzed_date"],
-            })
+        if dif is not None and dea is not None and macd_bar is not None:
+            if dif > dea and macd_bar > 0:
+                candidates.append({
+                    "stock_id": sid,
+                    "close": ind.get("close"),
+                    "DIF": round(dif, 4),
+                    "DEA": round(dea, 4),
+                    "MACD_Bar": round(macd_bar, 4),
+                    "date": ind.get("date"),
+                })
 
-    candidates.sort(key=lambda x: x["score"], reverse=True)
+    candidates.sort(key=lambda x: x["DIF"], reverse=True)
     return candidates
 
 
-def scan_volume_surge(threshold: float = 1.8) -> list:
-    """篩選量能暴增股票（今日成交量 > 20日均量 * 倍數）"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT DISTINCT stock_id FROM daily_price ORDER BY stock_id")
-    stocks = [r[0] for r in cursor.fetchall()]
-    conn.close()
-
+def scan_ma_bull(market: str = "TW") -> list:
+    """均線多頭排列（只看 watchlist）"""
+    watchlist = get_watchlist_stocks(market)
     candidates = []
-    import logging
-    for sid in stocks:
-        r = generate_signals(sid)
-        if "error" in r:
-            logging.debug(f"Skipping {sid}: {r['error']}")
-            continue
-        ind = r["indicators"]
-        vol = r["volume"]
-        vol5_ma = ind.get("Vol_5MA")
-        vol20_ma = ind.get("Vol_20MA")
 
-        if vol5_ma and vol20_ma and vol > vol5_ma * threshold:
-            ratio = vol / vol5_ma
+    for sid, _ in watchlist:
+        ind = get_indicators(sid)
+        if ind is None:
+            continue
+        ma5, ma20, ma60 = ind.get("MA5"), ind.get("MA20"), ind.get("MA60")
+        if all(x is not None for x in [ma5, ma20, ma60]):
+            if ma5 > ma20 > ma60:
+                candidates.append({
+                    "stock_id": sid,
+                    "close": ind.get("close"),
+                    "MA5": round(ma5, 2),
+                    "MA20": round(ma20, 2),
+                    "MA60": round(ma60, 2),
+                    "date": ind.get("date"),
+                })
+
+    candidates.sort(key=lambda x: x["close"], reverse=True)
+    return candidates
+
+
+def scan_vol_spike(market: str = "TW", threshold: float = 1.8) -> list:
+    """量能暴增（只看 watchlist）"""
+    watchlist = get_watchlist_stocks(market)
+    candidates = []
+
+    for sid, _ in watchlist:
+        ind = get_indicators(sid)
+        if ind is None:
+            continue
+        vol = ind.get("volume")
+        vol5_ma = ind.get("Vol_MA5")
+        if vol5_ma and vol and vol > vol5_ma * threshold:
             candidates.append({
                 "stock_id": sid,
-                "close": r["close"],
+                "close": ind.get("close"),
                 "volume": vol,
-                "vol_5ma": vol5_ma,
-                "vol_ratio": round(ratio, 2),
-                "score": r["score"],
-                "label": r["score_label"],
-                "date": r["analyzed_date"],
+                "vol_5ma": round(vol5_ma, 0),
+                "vol_ratio": round(vol / vol5_ma, 2),
+                "date": ind.get("date"),
             })
 
     candidates.sort(key=lambda x: x["vol_ratio"], reverse=True)
     return candidates
 
 
-def scan_ma_bull排列() -> list:
-    """篩選均線多頭排列（MA5 > MA20 > MA60）"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT DISTINCT stock_id FROM daily_price ORDER BY stock_id")
-    stocks = [r[0] for r in cursor.fetchall()]
-    conn.close()
-
-    candidates = []
-    import logging
-    for sid in stocks:
-        r = generate_signals(sid)
-        if "error" in r:
-            logging.debug(f"Skipping {sid}: {r['error']}")
-            continue
-        ind = r["indicators"]
-        ma5 = ind.get("MA5")
-        ma20 = ind.get("MA20")
-        ma60 = ind.get("MA60")
-        if all(x is not None for x in [ma5, ma20, ma60]):
-            if ma5 > ma20 > ma60:
-                candidates.append({
-                    "stock_id": sid,
-                    "close": r["close"],
-                    "MA5": ma5,
-                    "MA20": ma20,
-                    "MA60": ma60,
-                    "score": r["score"],
-                    "label": r["score_label"],
-                    "date": r["analyzed_date"],
-                })
-
-    candidates.sort(key=lambda x: x["score"], reverse=True)
-    return candidates
-
-
-def run_all_scans() -> dict:
-    """一口氣跑所有掃描，回傳結果（含 Jin10 宏觀警訊）"""
-    print("🔍 Stephanie 股票掃描器")
+def run_all_scans(market: str = "TW") -> dict:
+    """一口氣跑所有掃描（白名單版）"""
+    watchlist = get_watchlist_stocks(market)
+    print(f"🔍 Stephanie 掃描器（白名單模式）")
+    print(f"   監控中：{len(watchlist)} 檔 | 市場：{market}")
     print("=" * 50)
 
-    results = {}
-
-    # ── 宏觀前置檢查 ────────────────────────────────────────
+    # ── 宏觀前置檢查 ────────────────────────────────────
     if JIN10_AVAILABLE:
         try:
             macro_score = jc.get_macro_sentiment()
             macro_flag = jc.check_macro_threshold(macro_score)
             print(f"\n🌐 宏觀情緒：{macro_score:.1f}/100  [{macro_flag}]")
-
             alert = jc.check_macro_alerts()
             if alert:
-                print(f"  {alert}")
-        except Exception as e:
-            macro_score = None
+                print(f"  📢 {alert}")
+        except Exception:
             macro_flag = "N/A"
-            print(f"\n⚠️  宏觀數據取得失敗：{e}")
+            print("\n⚠️  宏觀數據取得失敗（使用預設值）")
     else:
-        macro_score = None
         macro_flag = "N/A"
-        print("\n⚠️  Jin10 未啟用（未安裝或無法載入）")
+        print("\n⚠️  Jin10 未啟用")
 
-    print("\n📌 掃描 1：KD 黃金交叉（低檔）")
-    print("-" * 40)
-    kd = scan_kd_gold_cross()
-    results["kd_gold_cross"] = kd[:10]
-    for i, c in enumerate(kd[:10], 1):
-        print(f"  {i}. {c['stock_id']} 收{c['close']} | K={c['K']} D={c['D']} | 評分{c['score']}/10 {c['label']}")
-
-    print("\n📌 掃描 2：MACD 多頭")
-    print("-" * 40)
-    macd = scan_macd_bull()
-    results["macd_bull"] = macd[:10]
-    for i, c in enumerate(macd[:10], 1):
-        print(f"  {i}. {c['stock_id']} 收{c['close']} | DIF={c['DIF']} DEA={c['DEA']} | 評分{c['score']}/10")
-
-    print("\n📌 掃描 3：量能暴增（>1.8倍）")
-    print("-" * 40)
-    vol = scan_volume_surge(1.8)
-    results["volume_surge"] = vol[:10]
-    for i, c in enumerate(vol[:10], 1):
-        print(f"  {i}. {c['stock_id']} 收{c['close']} | 量比{c['vol_ratio']}x | 評分{c['score']}/10")
-
-    print("\n📌 掃描 4：均線多頭排列")
-    print("-" * 40)
-    ma = scan_ma_bull排列()
-    results["ma_bull"] = ma[:10]
-    for i, c in enumerate(ma[:10], 1):
-        print(f"  {i}. {c['stock_id']} 收{c['close']} | MA5={c['MA5']} MA20={c['MA20']} MA60={c['MA60']} | 評分{c['score']}/10")
-
-    # ── 宏觀結論 ───────────────────────────────────────────
-    if macro_flag != "N/A":
-        print(f"\n{'='*50}")
-        if macro_flag == "BULL":
-            print("✅ 宏觀偏多，策略積極（可參考推薦股票）")
-        elif macro_flag == "BEAR":
-            print("⚠️  宏觀偏空，策略謹慎（注意倉位控制）")
-        else:
-            print("➡️  宏觀中性，觀望為主")
-        print("✅ 掃描完成")
-    else:
-        print(f"\n{'='*50}")
-        print("✅ 掃描完成")
-    return results
-
-
-
-
-# ── Batch Scan Functions (N+1 Query Fix) ─────────────────────────────────
-
-def scan_kd_batch(stock_ids: list, min_k: float = 20, max_k: float = 80) -> list:
-    """批量 KD 黃金交叉掃描（單一 DB 查詢）"""
-    if not stock_ids:
-        return []
-    
-    all_data = get_price_data_batch(stock_ids, days=120)
-    
-    candidates = []
-    for sid, data in all_data.items():
-        if len(data) < 60:
-            logging.debug(f"Skipping {sid}: insufficient data")
-            continue
-        
-        try:
-            closes = [d["close"] for d in data]
-            highs = [d["high"] for d in data]
-            lows = [d["low"] for d in data]
-            
-            k, d = calc_kd(highs, lows, closes)
-            if k and d and k[-1] > d[-1] and max_k > k[-1] > min_k:
-                candidates.append({
-                    "stock_id": sid,
-                    "close": closes[-1],
-                    "K": k[-1],
-                    "D": d[-1],
-                })
-        except Exception as e:
-            logging.debug(f"Error processing {sid}: {e}")
-    
-    candidates.sort(key=lambda x: x["K"], reverse=True)
-    return candidates
-
-
-def scan_macd_batch(stock_ids: list) -> list:
-    """批量 MACD 多頭掃描（單一 DB 查詢）"""
-    if not stock_ids:
-        return []
-    
-    all_data = get_price_data_batch(stock_ids, days=120)
-    
-    candidates = []
-    for sid, data in all_data.items():
-        if len(data) < 60:
-            continue
-        
-        try:
-            closes = [d["close"] for d in data]
-            dif, dea, macd_bar = calc_macd(closes)
-            
-            if dif and dea and dif[-1] > dea[-1] and macd_bar[-1] > 0:
-                candidates.append({
-                    "stock_id": sid,
-                    "close": closes[-1],
-                    "DIF": dif[-1],
-                    "DEA": dea[-1],
-                    "MACD_Bar": macd_bar[-1],
-                })
-        except Exception as e:
-            logging.debug(f"Error processing {sid}: {e}")
-    
-    candidates.sort(key=lambda x: x["DIF"], reverse=True)
-    return candidates
-
-
-def scan_volume_surge_batch(stock_ids: list, threshold: float = 1.8) -> list:
-    """批量量能暴增掃描（單一 DB 查詢）"""
-    if not stock_ids:
-        return []
-    
-    all_data = get_price_data_batch(stock_ids, days=120)
-    
-    candidates = []
-    for sid, data in all_data.items():
-        if len(data) < 25:
-            continue
-        
-        try:
-            closes = [d["close"] for d in data]
-            volumes = [d["volume"] for d in data]
-            
-            vol5_ma = calc_ma(volumes, 5)
-            vol20_ma = calc_ma(volumes, 20)
-            
-            vol5 = vol5_ma[-1] if vol5_ma else None
-            vol20 = vol20_ma[-1] if vol20_ma else None
-            vol = volumes[-1]
-            
-            if vol5 and vol20 and vol > vol5 * threshold:
-                candidates.append({
-                    "stock_id": sid,
-                    "close": closes[-1],
-                    "vol_ratio": vol / vol5,
-                })
-        except Exception as e:
-            logging.debug(f"Error processing {sid}: {e}")
-    
-    candidates.sort(key=lambda x: x["vol_ratio"], reverse=True)
-    return candidates
-
-
-def scan_ma_bull_batch(stock_ids: list) -> list:
-    """批量均線多頭排列掃描（單一 DB 查詢）"""
-    if not stock_ids:
-        return []
-    
-    all_data = get_price_data_batch(stock_ids, days=120)
-    
-    candidates = []
-    for sid, data in all_data.items():
-        if len(data) < 65:
-            continue
-        
-        try:
-            closes = [d["close"] for d in data]
-            
-            ma5 = calc_ma(closes, 5)
-            ma20 = calc_ma(closes, 20)
-            ma60 = calc_ma(closes, 60)
-            
-            ma5_v = ma5[-1] if ma5 else None
-            ma20_v = ma20[-1] if ma20 else None
-            ma60_v = ma60[-1] if ma60 else None
-            
-            if all(x is not None for x in [ma5_v, ma20_v, ma60_v]):
-                if ma5_v > ma20_v > ma60_v:
-                    candidates.append({
-                        "stock_id": sid,
-                        "close": closes[-1],
-                        "MA5": ma5_v,
-                        "MA20": ma20_v,
-                        "MA60": ma60_v,
-                    })
-        except Exception as e:
-            logging.debug(f"Error processing {sid}: {e}")
-    
-    candidates.sort(key=lambda x: x["close"], reverse=True)
-    return candidates
-
-
-def run_all_scans_batch() -> dict:
-    """一口氣跑所有批量掃描（優化版）"""
-    print("🔍 Stephanie 股票掃描器 (Batch Mode)")
-    print("=" * 50)
-    
-    # Fetch all stocks once
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT DISTINCT stock_id FROM daily_price ORDER BY stock_id")
-    stock_ids = [r[0] for r in cursor.fetchall()]
-    conn.close()
-    
-    print(f"📊 共 {len(stock_ids)} 檔股票")
-    
     results = {}
-    
-    print("\n📌 掃描 1：KD 黃金交叉")
+
+    print("\n📌 KD 低檔黃金交叉")
     print("-" * 40)
-    kd = scan_kd_batch(stock_ids, min_k=20, max_k=80)
-    results["kd_cross"] = kd[:10]
-    for i, c in enumerate(kd[:10], 1):
-        print(f"  {i}. {c['stock_id']} K={c['K']:.1f} D={c['D']:.1f}")
-    
-    print("\n📌 掃描 2：MACD 多頭")
+    kd = scan_kd_gold_cross(market)
+    results["kd_gold_cross"] = kd
+    if kd:
+        for i, c in enumerate(kd, 1):
+            print(f"  {i}. {c['stock_id']} 收{c['close']} | K={c['K']:.1f} D={c['D']:.1f}")
+    else:
+        print("  （無）")
+
+    print("\n📌 MACD 多頭")
     print("-" * 40)
-    macd = scan_macd_batch(stock_ids)
-    results["macd_bull"] = macd[:10]
-    for i, c in enumerate(macd[:10], 1):
-        print(f"  {i}. {c['stock_id']} DIF={c['DIF']:.2f} DEA={c['DEA']:.2f}")
-    
-    print("\n📌 掃描 3：量能暴增")
+    macd = scan_macd_bull(market)
+    results["macd_bull"] = macd
+    if macd:
+        for i, c in enumerate(macd, 1):
+            print(f"  {i}. {c['stock_id']} 收{c['close']} | DIF={c['DIF']:.4f} DEA={c['DEA']:.4f}")
+    else:
+        print("  （無）")
+
+    print("\n📌 均線多頭排列")
     print("-" * 40)
-    vol = scan_volume_surge_batch(stock_ids, 1.8)
-    results["volume_surge"] = vol[:10]
-    for i, c in enumerate(vol[:10], 1):
-        print(f"  {i}. {c['stock_id']} 量比={c['vol_ratio']:.1f}x")
-    
-    print("\n📌 掃描 4：均線多頭排列")
+    ma = scan_ma_bull(market)
+    results["ma_bull"] = ma
+    if ma:
+        for i, c in enumerate(ma, 1):
+            print(f"  {i}. {c['stock_id']} 收{c['close']} | {c['MA5']:.1f}>{c['MA20']:.1f}>{c['MA60']:.1f}")
+    else:
+        print("  （無）")
+
+    print("\n📌 量能暴增（>1.8倍）")
     print("-" * 40)
-    ma = scan_ma_bull_batch(stock_ids)
-    results["ma_bull"] = ma[:10]
-    for i, c in enumerate(ma[:10], 1):
-        print(f"  {i}. {c['stock_id']} MA5={c['MA5']:.1f} MA20={c['MA20']:.1f} MA60={c['MA60']:.1f}")
-    
+    vol = scan_vol_spike(market)
+    results["volume_surge"] = vol
+    if vol:
+        for i, c in enumerate(vol, 1):
+            print(f"  {i}. {c['stock_id']} 收{c['close']} | 量比{c['vol_ratio']:.1f}x")
+    else:
+        print("  （無）")
+
     print(f"\n{'='*50}")
-    print("✅ 掃描完成")
+    print(f"✅ 完成 | 白名單 {len(watchlist)} 檔")
     return results
 
 
-if __name__ == "__main__":
-    run_all_scans_batch()
+# ── Watchlist 管理───────────────────────────────────────────────
+
+def add_to_watchlist(stock_id: str, name: str = None, market: str = "TW", notes: str = ""):
+    """新增股票到白名單"""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR REPLACE INTO watchlist (stock_id, name, market, notes, added_at, active)
+        VALUES (?, ?, ?, ?, datetime('now'), 1)
+    """, (stock_id, name or stock_id, market, notes))
+    conn.commit()
+    conn.close()
+
+
+def remove_from_watchlist(stock_id: str):
+    """從白名單移除（軟刪除）"""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("UPDATE watchlist SET active = 0 WHERE stock_id = ?", (stock_id,))
+    conn.commit()
+    conn.close()
+
+
+def list_watchlist(market: str = "TW") -> list:
+    """列出白名單"""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT stock_id, name, market, notes, added_at
+        FROM watchlist WHERE active = 1 AND market = ?
+        ORDER BY added_at
+    """, (market,))
+    rows = cur.fetchall()
+    conn.close()
+    cols = ["stock_id","name","market","notes","added_at"]
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def init_default_watchlist():
+    """寫入預設追蹤標的"""
+    defaults = [
+        ("4967", "十銓",   "TW", "記憶體模組"),
+        ("2330", "台積電", "TW", "晶圓代工"),
+        ("2317", "鴻海",   "TW", "代工/AI供應鏈"),
+        ("2454", "聯發科", "TW", "IC設計"),
+        ("3008", "大立光", "TW", "光學鏡頭"),
+    ]
+    for sid, name, market, notes in defaults:
+        add_to_watchlist(sid, name, market, notes)
+    print(f"✅ 預設白名單寫入完成（{len(defaults)} 檔）")
 
 
 if __name__ == "__main__":
-    run_all_scans()
+    import sys
+    if len(sys.argv) > 1:
+        cmd = sys.argv[1]
+        if cmd == "--add":
+            add_to_watchlist(sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None)
+        elif cmd == "--remove":
+            remove_from_watchlist(sys.argv[2])
+        elif cmd == "--list":
+            for w in list_watchlist():
+                print(f"  {w['stock_id']} {w['name']} ({w['notes']})")
+        elif cmd == "--init-watchlist":
+            init_default_watchlist()
+        elif cmd == "--scan":
+            run_all_scans(sys.argv[2] if len(sys.argv) > 2 else "TW")
+        else:
+            print(f"未知指令：{cmd}")
+    else:
+        run_all_scans()
